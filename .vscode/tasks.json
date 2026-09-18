@@ -1,0 +1,112 @@
+{
+  // Stratos DL — VS Code 빌드 태스크
+  //   ⇧⌘B (Cmd+Shift+B) → 기본 빌드 태스크 실행
+  //   ⇧⌘P → "Tasks: Run Task" → 아래 목록에서 선택
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo: 개발 빌드",
+      "type": "cargo",
+      "command": "build",
+      "problemMatcher": ["$rustc"],
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "silent", "clear": true }
+    },
+    {
+      "label": "cargo: 릴리스 빌드",
+      "type": "cargo",
+      "command": "build",
+      "args": ["--release"],
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "cargo: 실행 (개발)",
+      "type": "cargo",
+      "command": "run",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "cargo: 테스트",
+      "type": "cargo",
+      "command": "test",
+      "problemMatcher": ["$rustc"],
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "cargo: clippy",
+      "type": "cargo",
+      "command": "clippy",
+      "args": ["--release", "--all-targets", "--", "-D", "warnings"],
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "cargo: fmt",
+      "type": "cargo",
+      "command": "fmt",
+      "args": ["--all"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent" }
+    },
+    {
+      "label": "make: check (fmt + clippy + 릴리스 빌드)",
+      "type": "shell",
+      "command": "make check",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "패키징: macOS .app",
+      "type": "shell",
+      "command": "make mac",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "패키징: macOS 유니버설 .app",
+      "type": "shell",
+      "command": "make mac-universal",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "패키징: Windows .exe",
+      "type": "shell",
+      "command": "make win",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "패키징: 전체 (dist)",
+      "type": "shell",
+      "command": "make dist",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "도구: yt-dlp / ffmpeg 설치",
+      "type": "shell",
+      "command": "make tools",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "도구: 설치 상태 확인",
+      "type": "shell",
+      "command": "make status",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "clear": true }
+    },
+    {
+      "label": "정리: clean",
+      "type": "shell",
+      "command": "make clean",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "clear": true }
+    }
+  ]
+}

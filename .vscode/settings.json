@@ -1,0 +1,24 @@
+{
+  // 저장 시 rustfmt 적용
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  // 저장할 때마다 clippy 로 검사 (문제 패널에 경고 표시)
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.cargo.features": [],
+  // target/ 만 탐색기에서 숨긴다. dist/ 는 결과물을 확인해야 하므로 보이게 둔다.
+  "files.exclude": {
+    "**/target": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/dist": true,
+    "Cargo.lock": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/dist/**": true
+  }
+}

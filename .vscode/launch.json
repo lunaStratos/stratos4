@@ -1,0 +1,70 @@
+{
+  // 디버그 실행 (F5) — CodeLLDB 확장(vadimcn.vscode-lldb) 필요
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "stratos4 YT Downloader 실행 (디버그)",
+      "cargo": {
+        "args": ["build", "--bin=stratos-dl", "--package=stratos-dl"],
+        "filter": { "name": "stratos-dl", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_BACKTRACE": "1" }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "stratos4 YT Downloader 실행 (릴리스)",
+      "cargo": {
+        "args": ["build", "--release", "--bin=stratos-dl", "--package=stratos-dl"],
+        "filter": { "name": "stratos-dl", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "stratos4 YT Downloader — 도구 상태 확인 (--check-tools)",
+      "cargo": {
+        "args": ["build", "--bin=stratos-dl", "--package=stratos-dl"],
+        "filter": { "name": "stratos-dl", "kind": "bin" }
+      },
+      "args": ["--check-tools"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "stratos4 YT Downloader — URL 다운로드 (--download)",
+      "cargo": {
+        "args": ["build", "--bin=stratos-dl", "--package=stratos-dl"],
+        "filter": { "name": "stratos-dl", "kind": "bin" }
+      },
+      "args": ["--download", "${input:downloadUrl}"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "단위 테스트 디버그",
+      "cargo": {
+        "args": ["test", "--no-run", "--package=stratos-dl"],
+        "filter": { "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "downloadUrl",
+      "type": "promptString",
+      "description": "다운로드할 URL",
+      "default": "https://www.youtube.com/watch?v="
+    }
+  ]
+}
