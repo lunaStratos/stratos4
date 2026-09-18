@@ -93,8 +93,8 @@ Windows 릴리스 빌드는 콘솔 창 없이 실행된다(`windows_subsystem = 
 `.github/workflows/build.yml` 이 세 단계로 동작한다.
 
 1. **check** — `cargo fmt --check` 와 `clippy -D warnings`
-2. **build** — macOS arm64 / macOS x64 / Windows x64 를 병렬 빌드해 아티팩트 업로드
-3. **release** — `v*` 태그를 푸시하면 GitHub Release 를 만들고 zip 세 개를 첨부
+2. **build** — macOS 통합(Intel + Apple Silicon) / Windows x64 를 병렬 빌드해 아티팩트 업로드
+3. **release** — `v*` 태그를 푸시하면 GitHub Release 를 만들고 zip 과 `.exe` 를 첨부
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0   # → 릴리스 자동 생성

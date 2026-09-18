@@ -97,8 +97,8 @@ Windows release builds run without a console window (`windows_subsystem = "windo
 `.github/workflows/build.yml` runs in three stages.
 
 1. **check** — `cargo fmt --check` and `clippy -D warnings`
-2. **build** — builds macOS arm64 / macOS x64 / Windows x64 in parallel and uploads artifacts
-3. **release** — pushing a `v*` tag creates a GitHub Release with the three zips attached
+2. **build** — builds macOS universal (Intel + Apple Silicon) and Windows x64 in parallel, uploading artifacts
+3. **release** — pushing a `v*` tag creates a GitHub Release with the zips and the `.exe` attached
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0   # → release created automatically

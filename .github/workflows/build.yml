@@ -34,10 +34,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14        # Apple Silicon
-            name: macos-arm64
-          - os: macos-13        # Intel
-            name: macos-x64
+          # Apple Silicon 러너에서 Intel 슬라이스까지 만들어 통합 바이너리로 낸다.
+          # (Intel 전용 macos-13 러너는 2025-12 에 퇴역했다.)
+          - os: macos-14
+            name: macos-universal
           - os: windows-latest
             name: windows-x64
     runs-on: ${{ matrix.os }}
@@ -46,9 +46,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: 빌드 및 패키징 (macOS)
+      - name: 빌드 및 패키징 (macOS, 통합 바이너리)
         if: runner.os == 'macOS'
-        run: ./scripts/build.sh mac
+        run: ./scripts/build.sh mac-universal
 
       - name: 빌드 (Windows)
         if: runner.os == 'Windows'
