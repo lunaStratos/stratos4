@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::i18n::Lang;
 use crate::util::shell_split;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,6 +126,8 @@ pub struct Settings {
 
     // ── 기타 ──────────────────────────────────────────
     pub theme: ThemePref,
+    /// 표시 언어. None 이면 OS 의 언어를 따른다.
+    pub language: Option<Lang>,
     pub ignore_yt_dlp_config: bool,
     pub extra_args: String,
 }
@@ -184,6 +187,7 @@ impl Default for Settings {
             last_update_check: 0,
 
             theme: ThemePref::System,
+            language: None,
             ignore_yt_dlp_config: true,
             extra_args: String::new(),
         }

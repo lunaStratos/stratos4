@@ -7,6 +7,7 @@ use egui::{Color32, RichText};
 
 use crate::config::{BinMode, Mode, PlaylistMode, Settings, ThemePref};
 use crate::engine::{Engine, Job, JobKind, Status};
+use crate::i18n::{self, t, tf, Key, Lang};
 use crate::tools::{self, SharedTools, ToolState, Tools};
 use crate::util::{fmt_bytes, fmt_eta, fmt_speed};
 
@@ -40,10 +41,11 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        crate::util::install_korean_font(&cc.egui_ctx);
         cc.egui_ctx.set_pixels_per_point(1.15);
 
         let mut settings = Settings::load();
+        // 표시 언어를 먼저 확정해야 그 문자에 맞는 폰트를 올릴 수 있다.
+        crate::util::install_fonts(&cc.egui_ctx, i18n::apply_pref(settings.language));
         apply_theme(&cc.egui_ctx, settings.theme);
 
         let settings_arc = Arc::new(Mutex::new(settings.clone()));
@@ -111,15 +113,15 @@ impl App {
         let urls = crate::util::find_urls(text);
         if urls.is_empty() {
             if !quiet {
-                self.toast("URL 을 찾지 못했습니다.");
+                self.toast(t(Key::ToastNoUrl));
             }
             return;
         }
         let n = self.engine.add_many(&urls, self.add_mode);
         if n == 0 {
-            self.toast("이미 대기열에 있는 URL 입니다.");
+            self.toast(t(Key::ToastDuplicate));
         } else {
-            self.toast(format!("{n}개 추가됨"));
+            self.toast(tf(Key::ToastAdded, &[&n.to_string()]));
         }
     }
 
@@ -148,7 +150,7 @@ impl App {
         }
         let n = self.engine.add_many(&urls, self.add_mode);
         if n > 0 {
-            self.toast(format!("클립보드에서 {n}개 추가됨"));
+            self.toast(tf(Key::ToastAddedClipboard, &[&n.to_string()]));
         }
     }
 
@@ -176,7 +178,7 @@ fn tool_chip(ui: &mut egui::Ui, name: &str, st: &ToolState) -> egui::Response {
             .map(|(g, t, _)| format!(" {:.0}%", *g as f32 / *t as f32 * 100.0))
             .unwrap_or_default();
         (
-            format!("{name} 갱신 중{pct}"),
+            format!("{}{pct}", tf(Key::ToolUpdating, &[name])),
             Color32::from_rgb(210, 175, 70),
             st.message.clone(),
         )
@@ -185,9 +187,9 @@ fn tool_chip(ui: &mut egui::Ui, name: &str, st: &ToolState) -> egui::Response {
             Some(v) if st.update_available() => (
                 format!("{name} {v} ↑"),
                 Color32::from_rgb(220, 150, 60),
-                format!(
-                    "새 버전 {} 사용 가능",
-                    st.latest_pretty().unwrap_or_default()
+                tf(
+                    Key::ToolNewVersionAvailable,
+                    &[&st.latest_pretty().unwrap_or_default()],
                 ),
             ),
             Some(v) => (
@@ -199,10 +201,10 @@ fn tool_chip(ui: &mut egui::Ui, name: &str, st: &ToolState) -> egui::Response {
                     .unwrap_or_else(|| st.message.clone()),
             ),
             None => (
-                format!("{name} 없음"),
+                tf(Key::ToolMissing, &[name]),
                 Color32::from_rgb(220, 90, 90),
                 if st.message.is_empty() {
-                    format!("{name} 이(가) 설치되어 있지 않습니다. 설정에서 설치하세요.")
+                    tf(Key::ToolNotInstalledHint, &[name])
                 } else {
                     st.message.clone()
                 },
@@ -310,10 +312,10 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("stratos4 YT Downloader");
-                ui.label(RichText::new("yt-dlp 기반 다운로더").weak().small());
+                ui.label(RichText::new(t(Key::AppSubtitle)).weak().small());
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙  설정").clicked() {
+                    if ui.button(format!("⚙  {}", t(Key::BtnSettings))).clicked() {
                         self.show_settings = !self.show_settings;
                     }
                     let t = self.tools.lock().unwrap().clone();
@@ -329,14 +331,24 @@ impl App {
             // 도구를 내려받는 동안에만 보이는 진행 막대
             let dl = {
                 let t = self.tools.lock().unwrap();
-                t.ytdlp.progress.clone().or_else(|| t.ffmpeg.progress.clone())
+                t.ytdlp
+                    .progress
+                    .clone()
+                    .or_else(|| t.ffmpeg.progress.clone())
             };
             if let Some((got, total, label)) = dl {
-                let frac = if total > 0 { got as f32 / total as f32 } else { 0.0 };
-                let text = if total > 0 {
-                    format!("{label} 내려받는 중  {} / {}", fmt_bytes(got), fmt_bytes(total))
+                let frac = if total > 0 {
+                    got as f32 / total as f32
                 } else {
-                    format!("{label} 내려받는 중  {}", fmt_bytes(got))
+                    0.0
+                };
+                let text = if total > 0 {
+                    tf(
+                        Key::ToolDownloadingSized,
+                        &[&label, &fmt_bytes(got), &fmt_bytes(total)],
+                    )
+                } else {
+                    tf(Key::ToolDownloading, &[&label, &fmt_bytes(got)])
                 };
                 ui.add(
                     egui::ProgressBar::new(frac)
@@ -354,11 +366,15 @@ impl App {
                     [(ui.available_width() - reserved).max(160.0), 28.0],
                     egui::TextEdit::singleline(&mut self.input)
                         .id(url_input_id())
-                        .hint_text("여기에 URL 을 붙여넣으세요 (Ctrl/Cmd+V) — 플레이리스트·채널 주소도 가능"),
+                        .hint_text(t(Key::UrlHint)),
                 );
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                if ui.add_sized([56.0, 28.0], egui::Button::new("추가")).clicked() || enter {
+                if ui
+                    .add_sized([56.0, 28.0], egui::Button::new(t(Key::BtnAdd)))
+                    .clicked()
+                    || enter
+                {
                     let text = std::mem::take(&mut self.input);
                     if !text.trim().is_empty() {
                         self.add_from_text(&text);
@@ -366,8 +382,11 @@ impl App {
                     resp.request_focus();
                 }
                 if ui
-                    .add_sized([84.0, 28.0], egui::Button::new("📋 붙여넣기"))
-                    .on_hover_text("클립보드 내용을 바로 대기열에 추가")
+                    .add_sized(
+                        [96.0, 28.0],
+                        egui::Button::new(format!("📋 {}", t(Key::BtnPaste))),
+                    )
+                    .on_hover_text(t(Key::BtnPasteTip))
                     .clicked()
                 {
                     let text = self
@@ -388,18 +407,20 @@ impl App {
                 let mut st = self.settings.lock().unwrap();
                 let mut changed = false;
 
-                ui.label(RichText::new("다운로드").weak());
+                ui.label(RichText::new(t(Key::LblDownload)).weak());
                 egui::ComboBox::from_id_salt("quick_mode")
                     .width(88.0)
                     .selected_text(mode_label(st.mode))
                     .show_ui(ui, |ui| {
                         for m in [Mode::Video, Mode::Audio] {
-                            changed |= ui.selectable_value(&mut st.mode, m, mode_label(m)).changed();
+                            changed |= ui
+                                .selectable_value(&mut st.mode, m, mode_label(m))
+                                .changed();
                         }
                     });
 
                 ui.add_space(8.0);
-                ui.label(RichText::new("화질").weak());
+                ui.label(RichText::new(t(Key::LblQuality)).weak());
                 if st.mode == Mode::Video {
                     egui::ComboBox::from_id_salt("quick_q")
                         .width(104.0)
@@ -429,7 +450,7 @@ impl App {
                         });
 
                     ui.add_space(8.0);
-                    ui.label(RichText::new("포맷").weak());
+                    ui.label(RichText::new(t(Key::LblFormat)).weak());
                     egui::ComboBox::from_id_salt("quick_af")
                         .width(80.0)
                         .selected_text(st.audio_format.clone())
@@ -445,7 +466,7 @@ impl App {
                 }
 
                 ui.add_space(8.0);
-                ui.label(RichText::new("플레이리스트").weak());
+                ui.label(RichText::new(t(Key::LblPlaylist)).weak());
                 let cur = self.add_mode.unwrap_or(st.playlist_mode);
                 let mut sel = cur;
                 egui::ComboBox::from_id_salt("quick_pl")
@@ -467,8 +488,8 @@ impl App {
 
                 ui.add_space(8.0);
                 changed |= ui
-                    .checkbox(&mut st.clipboard_watch, "복사 즉시 추가")
-                    .on_hover_text("켜면 붙여넣지 않아도 URL 을 복사하는 순간 대기열에 들어갑니다.")
+                    .checkbox(&mut st.clipboard_watch, t(Key::ChkClipboardQuick))
+                    .on_hover_text(t(Key::ChkClipboardQuickTip))
                     .changed();
 
                 if changed {
@@ -486,27 +507,36 @@ impl App {
             ui.horizontal(|ui| {
                 let (r, q, d, f) = self.engine.counts();
                 ui.label(
-                    RichText::new(format!("진행 {r} · 대기 {q} · 완료 {d} · 실패 {f}")).small(),
+                    RichText::new(tf(
+                        Key::StatusCounts,
+                        &[
+                            &r.to_string(),
+                            &q.to_string(),
+                            &d.to_string(),
+                            &f.to_string(),
+                        ],
+                    ))
+                    .small(),
                 );
 
                 ui.separator();
                 let dir = self.settings.lock().unwrap().target_dir();
                 if ui
                     .link(RichText::new(format!("📁 {}", dir.display())).small())
-                    .on_hover_text("저장 폴더 열기")
+                    .on_hover_text(t(Key::TipOpenFolder))
                     .clicked()
                 {
                     let _ = open::that_detached(&dir);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("완료 항목 정리").clicked() {
+                    if ui.button(t(Key::BtnClearFinished)).clicked() {
                         self.engine.clear_finished();
                     }
-                    if ui.button("⏸ 전체 일시정지").clicked() {
+                    if ui.button(format!("⏸ {}", t(Key::BtnPauseAll))).clicked() {
                         self.engine.pause_all();
                     }
-                    if ui.button("▶ 전체 시작").clicked() {
+                    if ui.button(format!("▶ {}", t(Key::BtnStartAll))).clicked() {
                         self.engine.start_all();
                     }
                     if let Some((msg, at)) = &self.toast {
@@ -533,13 +563,7 @@ impl App {
             let mut jobs = self.engine.jobs.lock().unwrap();
             if jobs.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "이 창에서 Ctrl/Cmd+V 로 URL 을 붙여넣으면 바로 다운로드가 시작됩니다.\n\
-                             플레이리스트·채널 주소도 그대로 붙여넣으세요.",
-                        )
-                        .weak(),
-                    );
+                    ui.label(RichText::new(t(Key::EmptyHint)).weak());
                 });
                 return;
             }
@@ -568,7 +592,7 @@ impl App {
                         let _ = cb.set_text(u.clone());
                         self.last_clip = u;
                     }
-                    self.toast("URL 을 복사했습니다.");
+                    self.toast(t(Key::ToastUrlCopied));
                 }
             }
         }
@@ -576,21 +600,19 @@ impl App {
 }
 
 fn playlist_mode_label(m: PlaylistMode) -> &'static str {
-    match m {
-        PlaylistMode::Expand => "항목별로 펼치기",
-        PlaylistMode::Single => "한 작업으로 일괄",
-        PlaylistMode::VideoOnly => "이 영상만",
-    }
+    t(match m {
+        PlaylistMode::Expand => Key::PlModeExpand,
+        PlaylistMode::Single => Key::PlModeSingle,
+        PlaylistMode::VideoOnly => Key::PlModeVideoOnly,
+    })
 }
 
 fn playlist_mode_hint(m: PlaylistMode) -> &'static str {
-    match m {
-        PlaylistMode::Expand => {
-            "목록을 읽어 항목마다 작업을 만듭니다 (개별 진행률·재시도·동시 다운로드)"
-        }
-        PlaylistMode::Single => "yt-dlp 가 목록 전체를 순서대로 처리합니다",
-        PlaylistMode::VideoOnly => "목록 파라미터를 무시하고 해당 영상 하나만 받습니다",
-    }
+    t(match m {
+        PlaylistMode::Expand => Key::PlHintExpand,
+        PlaylistMode::Single => Key::PlHintSingle,
+        PlaylistMode::VideoOnly => Key::PlHintVideoOnly,
+    })
 }
 
 fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
@@ -617,7 +639,7 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                         ui.label(RichText::new(format!("{i}/{n}")).small().weak());
                     }
                     if j.kind == JobKind::Resolve {
-                        ui.label(RichText::new("목록").small().weak());
+                        ui.label(RichText::new(t(Key::JobBadgeList)).small().weak());
                     }
                     let stamp = j.finished_at.unwrap_or(j.added);
                     ui.label(
@@ -625,7 +647,10 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                             .small()
                             .weak(),
                     )
-                    .on_hover_text(format!("추가 {}", j.added.format("%Y-%m-%d %H:%M:%S")));
+                    .on_hover_text(tf(
+                        Key::JobAddedAt,
+                        &[&j.added.format("%Y-%m-%d %H:%M:%S").to_string()],
+                    ));
                 });
             });
 
@@ -656,7 +681,7 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                     }
                     if j.eta > 0 {
                         ui.label(
-                            RichText::new(format!("남은 시간 {}", fmt_eta(j.eta)))
+                            RichText::new(tf(Key::JobEta, &[&fmt_eta(j.eta)]))
                                 .small()
                                 .weak(),
                         );
@@ -680,47 +705,59 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 match j.status {
                     Status::Running => {
-                        if ui.small_button("⏸ 일시정지").clicked() {
+                        if ui.small_button(format!("⏸ {}", t(Key::BtnPause))).clicked() {
                             acts.push(Act::Pause(j.id));
                         }
-                        if ui.small_button("⏹ 취소").clicked() {
+                        if ui
+                            .small_button(format!("⏹ {}", t(Key::BtnCancel)))
+                            .clicked()
+                        {
                             acts.push(Act::Cancel(j.id));
                         }
                     }
                     Status::Queued => {
-                        if ui.small_button("⏸ 보류").clicked() {
+                        if ui.small_button(format!("⏸ {}", t(Key::BtnHold))).clicked() {
                             acts.push(Act::Pause(j.id));
                         }
                     }
                     Status::Paused => {
-                        if ui.small_button("▶ 이어받기").clicked() {
+                        if ui
+                            .small_button(format!("▶ {}", t(Key::BtnResume)))
+                            .clicked()
+                        {
                             acts.push(Act::Start(j.id));
                         }
                     }
                     Status::Failed | Status::Canceled => {
-                        if ui.small_button("↻ 다시 시도").clicked() {
+                        if ui.small_button(format!("↻ {}", t(Key::BtnRetry))).clicked() {
                             acts.push(Act::Start(j.id));
                         }
                     }
                     Status::Done => {
                         if let Some(p) = j.filepath.clone() {
-                            if ui.small_button("▶ 열기").clicked() {
+                            if ui.small_button(format!("▶ {}", t(Key::BtnOpen))).clicked() {
                                 acts.push(Act::OpenFile(p.clone()));
                             }
-                            if ui.small_button("📂 위치 보기").clicked() {
+                            if ui
+                                .small_button(format!("📂 {}", t(Key::BtnReveal)))
+                                .clicked()
+                            {
                                 acts.push(Act::Reveal(p));
                             }
                         }
                     }
                 }
 
-                if ui.small_button("🔗 URL 복사").clicked() {
+                if ui
+                    .small_button(format!("🔗 {}", t(Key::BtnCopyUrl)))
+                    .clicked()
+                {
                     acts.push(Act::CopyUrl(j.url.clone()));
                 }
                 let log_label = if j.show_log {
-                    "로그 숨기기"
+                    t(Key::BtnHideLog)
                 } else {
-                    "로그"
+                    t(Key::BtnLog)
                 };
                 if ui.small_button(log_label).clicked() {
                     j.show_log = !j.show_log;
@@ -728,7 +765,7 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("✖")
-                        .on_hover_text("목록에서 제거")
+                        .on_hover_text(t(Key::TipRemoveFromList))
                         .clicked()
                     {
                         acts.push(Act::Remove(j.id));
@@ -768,12 +805,13 @@ impl App {
         let mut open = self.show_settings;
         let mut dirty = false;
         let mut theme_changed = None;
+        let mut lang_changed: Option<Option<Lang>> = None;
         let mut do_install_yt = false;
         let mut do_install_ff = false;
         let mut do_check = false;
         let mut reprobe = false;
 
-        egui::Window::new("설정")
+        egui::Window::new(t(Key::BtnSettings))
             .open(&mut open)
             .default_width(560.0)
             .max_height(640.0)
@@ -783,522 +821,650 @@ impl App {
                     let mut st = self.settings.lock().unwrap();
 
                     // ── 저장 위치 ─────────────────────────
-                    ui.heading("저장");
-                    egui::Grid::new("g_save").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        ui.label("저장 폴더");
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(st.download_dir.display().to_string()).small());
-                            if ui.small_button("변경").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_directory(&st.download_dir)
-                                    .pick_folder()
-                                {
-                                    st.download_dir = p;
-                                    dirty = true;
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("폴더 분리");
-                        ui.vertical(|ui| {
-                            dirty |= ui
-                                .checkbox(
-                                    &mut st.separate_media_dirs,
-                                    "영상과 오디오를 하위 폴더로 나눠 저장",
-                                )
-                                .changed();
-                            if st.separate_media_dirs {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("영상").small().weak());
-                                    dirty |= ui
-                                        .add(
-                                            egui::TextEdit::singleline(&mut st.video_subdir)
-                                                .desired_width(90.0),
-                                        )
-                                        .changed();
-                                    ui.label(RichText::new("오디오").small().weak());
-                                    dirty |= ui
-                                        .add(
-                                            egui::TextEdit::singleline(&mut st.audio_subdir)
-                                                .desired_width(90.0),
-                                        )
-                                        .changed();
-                                });
+                    ui.heading(t(Key::HdrSave));
+                    egui::Grid::new("g_save")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t(Key::LblSaveFolder));
+                            ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(format!(
-                                        "지금 저장 위치: {}",
-                                        st.target_dir().display()
-                                    ))
-                                    .small()
-                                    .weak(),
+                                    RichText::new(st.download_dir.display().to_string()).small(),
                                 );
+                                if ui.small_button(t(Key::BtnChange)).clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .set_directory(&st.download_dir)
+                                        .pick_folder()
+                                    {
+                                        st.download_dir = p;
+                                        dirty = true;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(t(Key::LblSeparateDirs));
+                            ui.vertical(|ui| {
+                                dirty |= ui
+                                    .checkbox(&mut st.separate_media_dirs, t(Key::ChkSeparateDirs))
+                                    .changed();
+                                if st.separate_media_dirs {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(t(Key::LblVideo)).small().weak());
+                                        dirty |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut st.video_subdir)
+                                                    .desired_width(90.0),
+                                            )
+                                            .changed();
+                                        ui.label(RichText::new(t(Key::LblAudio)).small().weak());
+                                        dirty |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut st.audio_subdir)
+                                                    .desired_width(90.0),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.label(
+                                        RichText::new(tf(
+                                            Key::LblCurrentTarget,
+                                            &[&st.target_dir().display().to_string()],
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(t(Key::LblFilenameTemplate));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut st.output_template)
+                                        .desired_width(320.0),
+                                )
+                                .on_hover_text(t(Key::TipFilenameTemplate))
+                                .changed()
+                            {
+                                dirty = true;
                             }
-                        });
-                        ui.end_row();
+                            ui.end_row();
 
-                        ui.label("파일명 형식");
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut st.output_template).desired_width(320.0))
-                            .on_hover_text("yt-dlp 출력 템플릿. 예: %(title)s.%(ext)s")
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.end_row();
-
-                        ui.label("");
-                        ui.vertical(|ui| {
-                            dirty |= ui
-                                .checkbox(&mut st.restrict_filenames, "파일명을 ASCII 로 제한")
-                                .changed();
-                            dirty |= ui
-                                .checkbox(&mut st.use_archive, "이미 받은 항목 건너뛰기 (아카이브 기록)")
-                                .changed();
+                            ui.label("");
+                            ui.vertical(|ui| {
+                                dirty |= ui
+                                    .checkbox(
+                                        &mut st.restrict_filenames,
+                                        t(Key::ChkRestrictFilenames),
+                                    )
+                                    .changed();
+                                dirty |= ui
+                                    .checkbox(&mut st.use_archive, t(Key::ChkUseArchive))
+                                    .changed();
+                            });
+                            ui.end_row();
                         });
-                        ui.end_row();
-                    });
 
                     ui.add_space(10.0);
-                    ui.heading("화질 / 포맷");
-                    egui::Grid::new("g_fmt").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        ui.label("다운로드");
-                        ui.horizontal(|ui| {
-                            for m in [Mode::Video, Mode::Audio] {
-                                dirty |= ui.selectable_value(&mut st.mode, m, mode_label(m)).changed();
-                            }
-                        });
-                        ui.end_row();
-
-                        if st.mode == Mode::Video {
-                            ui.label("최대 화질");
-                            egui::ComboBox::from_id_salt("q")
-                                .width(160.0)
-                                .selected_text(height_label(st.max_height))
-                                .show_ui(ui, |ui| {
-                                    for h in [0u32, 2160, 1440, 1080, 720, 480, 360] {
-                                        dirty |= ui
-                                            .selectable_value(&mut st.max_height, h, height_label(h))
-                                            .changed();
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("최대 프레임");
-                            egui::ComboBox::from_id_salt("fps")
-                                .width(160.0)
-                                .selected_text(if st.max_fps == 0 {
-                                    "제한 없음".to_string()
-                                } else {
-                                    format!("{} fps", st.max_fps)
-                                })
-                                .show_ui(ui, |ui| {
-                                    for f in [0u32, 60, 30] {
-                                        let l = if f == 0 {
-                                            "제한 없음".to_string()
-                                        } else {
-                                            format!("{f} fps")
-                                        };
-                                        dirty |= ui.selectable_value(&mut st.max_fps, f, l).changed();
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("코덱 선호");
-                            egui::ComboBox::from_id_salt("codec")
-                                .width(160.0)
-                                .selected_text(codec_label(&st.prefer_codec))
-                                .show_ui(ui, |ui| {
-                                    for c in ["auto", "h264", "av1", "vp9"] {
-                                        let mut cur = st.prefer_codec.clone();
-                                        if ui.selectable_value(&mut cur, c.to_string(), codec_label(c)).changed() {
-                                            st.prefer_codec = cur;
-                                            dirty = true;
-                                        }
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("컨테이너");
+                    ui.heading(t(Key::HdrQualityFormat));
+                    egui::Grid::new("g_fmt")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t(Key::LblDownload));
                             ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("cont")
-                                    .width(110.0)
-                                    .selected_text(if st.container == "auto" {
-                                        "자동".to_string()
+                                for m in [Mode::Video, Mode::Audio] {
+                                    dirty |= ui
+                                        .selectable_value(&mut st.mode, m, mode_label(m))
+                                        .changed();
+                                }
+                            });
+                            ui.end_row();
+
+                            if st.mode == Mode::Video {
+                                ui.label(t(Key::LblMaxQuality));
+                                egui::ComboBox::from_id_salt("q")
+                                    .width(160.0)
+                                    .selected_text(height_label(st.max_height))
+                                    .show_ui(ui, |ui| {
+                                        for h in [0u32, 2160, 1440, 1080, 720, 480, 360] {
+                                            dirty |= ui
+                                                .selectable_value(
+                                                    &mut st.max_height,
+                                                    h,
+                                                    height_label(h),
+                                                )
+                                                .changed();
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label(t(Key::LblMaxFps));
+                                egui::ComboBox::from_id_salt("fps")
+                                    .width(160.0)
+                                    .selected_text(if st.max_fps == 0 {
+                                        t(Key::Unlimited).to_string()
                                     } else {
-                                        st.container.clone()
+                                        format!("{} fps", st.max_fps)
                                     })
                                     .show_ui(ui, |ui| {
-                                        for c in ["auto", "mp4", "mkv", "webm"] {
-                                            let label = if c == "auto" { "자동" } else { c };
-                                            let mut cur = st.container.clone();
-                                            if ui.selectable_value(&mut cur, c.to_string(), label).changed() {
-                                                st.container = cur;
+                                        for f in [0u32, 60, 30] {
+                                            let l = if f == 0 {
+                                                t(Key::Unlimited).to_string()
+                                            } else {
+                                                format!("{f} fps")
+                                            };
+                                            dirty |= ui
+                                                .selectable_value(&mut st.max_fps, f, l)
+                                                .changed();
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label(t(Key::LblPreferCodec));
+                                egui::ComboBox::from_id_salt("codec")
+                                    .width(160.0)
+                                    .selected_text(codec_label(&st.prefer_codec))
+                                    .show_ui(ui, |ui| {
+                                        for c in ["auto", "h264", "av1", "vp9"] {
+                                            let mut cur = st.prefer_codec.clone();
+                                            if ui
+                                                .selectable_value(
+                                                    &mut cur,
+                                                    c.to_string(),
+                                                    codec_label(c),
+                                                )
+                                                .changed()
+                                            {
+                                                st.prefer_codec = cur;
                                                 dirty = true;
                                             }
                                         }
                                     });
-                                dirty |= ui
-                                    .checkbox(&mut st.force_remux, "강제 변환")
-                                    .on_hover_text("컨테이너가 다르면 remux 합니다 (재인코딩 없음)")
-                                    .changed();
-                            });
-                            ui.end_row();
-                        } else {
-                            ui.label("오디오 포맷");
-                            egui::ComboBox::from_id_salt("af")
-                                .width(160.0)
-                                .selected_text(&st.audio_format)
-                                .show_ui(ui, |ui| {
-                                    for f in AUDIO_FORMATS {
-                                        let mut cur = st.audio_format.clone();
-                                        if ui.selectable_value(&mut cur, f.to_string(), f).changed() {
-                                            st.audio_format = cur;
-                                            dirty = true;
-                                        }
-                                    }
-                                });
-                            ui.end_row();
+                                ui.end_row();
 
-                            ui.label("오디오 화질");
-                            egui::ComboBox::from_id_salt("ab")
-                                .width(160.0)
-                                .selected_text(bitrate_label(&st.audio_bitrate))
-                                .show_ui(ui, |ui| {
-                                    for b in AUDIO_BITRATES {
-                                        let mut cur = st.audio_bitrate.clone();
-                                        if ui
-                                            .selectable_value(&mut cur, b.to_string(), bitrate_label(b))
-                                            .changed()
-                                        {
-                                            st.audio_bitrate = cur;
-                                            dirty = true;
-                                        }
-                                    }
+                                ui.label(t(Key::LblContainer));
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("cont")
+                                        .width(110.0)
+                                        .selected_text(if st.container == "auto" {
+                                            t(Key::Auto).to_string()
+                                        } else {
+                                            st.container.clone()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for c in ["auto", "mp4", "mkv", "webm"] {
+                                                let label =
+                                                    if c == "auto" { t(Key::Auto) } else { c };
+                                                let mut cur = st.container.clone();
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut cur,
+                                                        c.to_string(),
+                                                        label,
+                                                    )
+                                                    .changed()
+                                                {
+                                                    st.container = cur;
+                                                    dirty = true;
+                                                }
+                                            }
+                                        });
+                                    dirty |= ui
+                                        .checkbox(&mut st.force_remux, t(Key::ChkForceRemux))
+                                        .on_hover_text(t(Key::TipForceRemux))
+                                        .changed();
                                 });
-                            ui.end_row();
-                        }
-                    });
+                                ui.end_row();
+                            } else {
+                                ui.label(t(Key::LblAudioFormat));
+                                egui::ComboBox::from_id_salt("af")
+                                    .width(160.0)
+                                    .selected_text(&st.audio_format)
+                                    .show_ui(ui, |ui| {
+                                        for f in AUDIO_FORMATS {
+                                            let mut cur = st.audio_format.clone();
+                                            if ui
+                                                .selectable_value(&mut cur, f.to_string(), f)
+                                                .changed()
+                                            {
+                                                st.audio_format = cur;
+                                                dirty = true;
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label(t(Key::LblAudioQuality));
+                                egui::ComboBox::from_id_salt("ab")
+                                    .width(160.0)
+                                    .selected_text(bitrate_label(&st.audio_bitrate))
+                                    .show_ui(ui, |ui| {
+                                        for b in AUDIO_BITRATES {
+                                            let mut cur = st.audio_bitrate.clone();
+                                            if ui
+                                                .selectable_value(
+                                                    &mut cur,
+                                                    b.to_string(),
+                                                    bitrate_label(b),
+                                                )
+                                                .changed()
+                                            {
+                                                st.audio_bitrate = cur;
+                                                dirty = true;
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                        });
 
                     ui.add_space(10.0);
-                    ui.heading("부가 옵션");
+                    ui.heading(t(Key::HdrExtras));
                     ui.horizontal_wrapped(|ui| {
-                        dirty |= ui.checkbox(&mut st.embed_metadata, "메타데이터 삽입").changed();
-                        dirty |= ui.checkbox(&mut st.embed_thumbnail, "썸네일 삽입").changed();
-                        dirty |= ui.checkbox(&mut st.embed_chapters, "챕터 삽입").changed();
                         dirty |= ui
-                            .checkbox(&mut st.sponsorblock_remove, "SponsorBlock 구간 제거")
+                            .checkbox(&mut st.embed_metadata, t(Key::ChkEmbedMetadata))
+                            .changed();
+                        dirty |= ui
+                            .checkbox(&mut st.embed_thumbnail, t(Key::ChkEmbedThumbnail))
+                            .changed();
+                        dirty |= ui
+                            .checkbox(&mut st.embed_chapters, t(Key::ChkEmbedChapters))
+                            .changed();
+                        dirty |= ui
+                            .checkbox(&mut st.sponsorblock_remove, t(Key::ChkSponsorBlock))
                             .changed();
                     });
                     if st.mode == Mode::Video {
                         ui.horizontal_wrapped(|ui| {
-                            dirty |= ui.checkbox(&mut st.write_subs, "자막 파일 저장").changed();
-                            dirty |= ui.checkbox(&mut st.auto_subs, "자동 생성 자막 포함").changed();
-                            dirty |= ui.checkbox(&mut st.embed_subs, "자막 영상에 삽입").changed();
-                            ui.label("언어");
                             dirty |= ui
-                                .add(egui::TextEdit::singleline(&mut st.sub_langs).desired_width(110.0))
-                                .on_hover_text("쉼표로 구분. 예: ko,en")
+                                .checkbox(&mut st.write_subs, t(Key::ChkWriteSubs))
+                                .changed();
+                            dirty |= ui
+                                .checkbox(&mut st.auto_subs, t(Key::ChkAutoSubs))
+                                .changed();
+                            dirty |= ui
+                                .checkbox(&mut st.embed_subs, t(Key::ChkEmbedSubs))
+                                .changed();
+                            ui.label(t(Key::LblSubLangs));
+                            dirty |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut st.sub_langs)
+                                        .desired_width(110.0),
+                                )
+                                .on_hover_text(t(Key::TipSubLangs))
                                 .changed();
                         });
                     }
 
                     ui.add_space(10.0);
-                    ui.heading("플레이리스트");
-                    egui::Grid::new("g_pl").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        ui.label("기본 처리 방식");
-                        egui::ComboBox::from_id_salt("plm")
-                            .width(180.0)
-                            .selected_text(playlist_mode_label(st.playlist_mode))
-                            .show_ui(ui, |ui| {
-                                for m in [
-                                    PlaylistMode::Expand,
-                                    PlaylistMode::Single,
-                                    PlaylistMode::VideoOnly,
-                                ] {
-                                    dirty |= ui
-                                        .selectable_value(&mut st.playlist_mode, m, playlist_mode_label(m))
-                                        .changed();
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label("항목 범위");
-                        dirty |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut st.playlist_items)
-                                    .desired_width(180.0)
-                                    .hint_text("예: 1-10, 15, 20-"),
-                            )
-                            .on_hover_text("비워 두면 전체")
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("펼치기 최대 개수");
-                        dirty |= ui
-                            .add(egui::DragValue::new(&mut st.playlist_expand_limit).range(0..=5000))
-                            .on_hover_text("0 = 무제한. 채널 전체처럼 큰 목록을 방어합니다.")
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("");
-                        dirty |= ui.checkbox(&mut st.playlist_reverse, "역순으로 받기").changed();
-                        ui.end_row();
-                    });
-
-                    ui.add_space(10.0);
-                    ui.heading("네트워크 / 동시성");
-                    egui::Grid::new("g_net").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        ui.label("동시 다운로드 수");
-                        dirty |= ui
-                            .add(egui::Slider::new(&mut st.max_concurrent_downloads, 1..=8))
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("조각 동시 전송");
-                        dirty |= ui
-                            .add(egui::Slider::new(&mut st.concurrent_fragments, 1..=16))
-                            .on_hover_text("yt-dlp -N 옵션")
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("속도 제한");
-                        dirty |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut st.rate_limit)
-                                    .desired_width(120.0)
-                                    .hint_text("예: 2M, 500K"),
-                            )
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("재시도 횟수");
-                        dirty |= ui.add(egui::DragValue::new(&mut st.retries).range(0..=100)).changed();
-                        ui.end_row();
-
-                        ui.label("프록시");
-                        dirty |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut st.proxy)
-                                    .desired_width(240.0)
-                                    .hint_text("http://host:port / socks5://host:port"),
-                            )
-                            .changed();
-                        ui.end_row();
-
-                        ui.label("브라우저 쿠키");
-                        egui::ComboBox::from_id_salt("cookies")
-                            .width(160.0)
-                            .selected_text(if st.cookies_from_browser.is_empty() {
-                                "사용 안 함".to_string()
-                            } else {
-                                st.cookies_from_browser.clone()
-                            })
-                            .show_ui(ui, |ui| {
-                                for b in ["", "chrome", "edge", "firefox", "safari", "brave", "whale", "opera"] {
-                                    let label = if b.is_empty() { "사용 안 함" } else { b };
-                                    let mut cur = st.cookies_from_browser.clone();
-                                    if ui.selectable_value(&mut cur, b.to_string(), label).changed() {
-                                        st.cookies_from_browser = cur;
-                                        dirty = true;
+                    ui.heading(t(Key::LblPlaylist));
+                    egui::Grid::new("g_pl")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t(Key::LblPlDefaultMode));
+                            egui::ComboBox::from_id_salt("plm")
+                                .width(180.0)
+                                .selected_text(playlist_mode_label(st.playlist_mode))
+                                .show_ui(ui, |ui| {
+                                    for m in [
+                                        PlaylistMode::Expand,
+                                        PlaylistMode::Single,
+                                        PlaylistMode::VideoOnly,
+                                    ] {
+                                        dirty |= ui
+                                            .selectable_value(
+                                                &mut st.playlist_mode,
+                                                m,
+                                                playlist_mode_label(m),
+                                            )
+                                            .changed();
                                     }
-                                }
-                            });
-                        ui.end_row();
-                    });
+                                });
+                            ui.end_row();
+
+                            ui.label(t(Key::LblPlItems));
+                            dirty |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut st.playlist_items)
+                                        .desired_width(180.0)
+                                        .hint_text(t(Key::HintPlItems)),
+                                )
+                                .on_hover_text(t(Key::TipPlItems))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblPlExpandLimit));
+                            dirty |= ui
+                                .add(
+                                    egui::DragValue::new(&mut st.playlist_expand_limit)
+                                        .range(0..=5000),
+                                )
+                                .on_hover_text(t(Key::TipPlExpandLimit))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label("");
+                            dirty |= ui
+                                .checkbox(&mut st.playlist_reverse, t(Key::ChkPlReverse))
+                                .changed();
+                            ui.end_row();
+                        });
 
                     ui.add_space(10.0);
-                    ui.heading("동작");
+                    ui.heading(t(Key::HdrNetwork));
+                    egui::Grid::new("g_net")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t(Key::LblMaxConcurrent));
+                            dirty |= ui
+                                .add(egui::Slider::new(&mut st.max_concurrent_downloads, 1..=8))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblConcurrentFragments));
+                            dirty |= ui
+                                .add(egui::Slider::new(&mut st.concurrent_fragments, 1..=16))
+                                .on_hover_text(t(Key::TipConcurrentFragments))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblRateLimit));
+                            dirty |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut st.rate_limit)
+                                        .desired_width(120.0)
+                                        .hint_text(t(Key::HintRateLimit)),
+                                )
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblRetries));
+                            dirty |= ui
+                                .add(egui::DragValue::new(&mut st.retries).range(0..=100))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblProxy));
+                            dirty |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut st.proxy)
+                                        .desired_width(240.0)
+                                        .hint_text("http://host:port / socks5://host:port"),
+                                )
+                                .changed();
+                            ui.end_row();
+
+                            ui.label(t(Key::LblBrowserCookies));
+                            egui::ComboBox::from_id_salt("cookies")
+                                .width(160.0)
+                                .selected_text(if st.cookies_from_browser.is_empty() {
+                                    t(Key::OptDisabled).to_string()
+                                } else {
+                                    st.cookies_from_browser.clone()
+                                })
+                                .show_ui(ui, |ui| {
+                                    for b in [
+                                        "", "chrome", "edge", "firefox", "safari", "brave",
+                                        "whale", "opera",
+                                    ] {
+                                        let label =
+                                            if b.is_empty() { t(Key::OptDisabled) } else { b };
+                                        let mut cur = st.cookies_from_browser.clone();
+                                        if ui
+                                            .selectable_value(&mut cur, b.to_string(), label)
+                                            .changed()
+                                        {
+                                            st.cookies_from_browser = cur;
+                                            dirty = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                        });
+
+                    ui.add_space(10.0);
+                    ui.heading(t(Key::HdrBehavior));
                     ui.vertical(|ui| {
                         dirty |= ui
-                            .checkbox(&mut st.paste_to_download, "창에 붙여넣으면 바로 추가 (Ctrl/Cmd+V)")
+                            .checkbox(&mut st.paste_to_download, t(Key::ChkPasteToDownload))
                             .changed();
                         dirty |= ui
-                            .checkbox(&mut st.clipboard_watch, "복사하는 즉시 추가 (클립보드 감시)")
-                            .on_hover_text("붙여넣지 않아도 URL 을 복사하는 순간 대기열에 들어갑니다")
+                            .checkbox(&mut st.clipboard_watch, t(Key::ChkClipboardWatch))
+                            .on_hover_text(t(Key::TipClipboardWatch))
                             .changed();
                         ui.horizontal_wrapped(|ui| {
-                            dirty |= ui.checkbox(&mut st.auto_start, "추가 즉시 다운로드 시작").changed();
-                            dirty |= ui.checkbox(&mut st.skip_duplicates, "중복 URL 무시").changed();
+                            dirty |= ui
+                                .checkbox(&mut st.auto_start, t(Key::ChkAutoStart))
+                                .changed();
+                            dirty |= ui
+                                .checkbox(&mut st.skip_duplicates, t(Key::ChkSkipDuplicates))
+                                .changed();
                         });
                     });
                     ui.horizontal(|ui| {
-                        ui.label("테마");
-                        for (t, l) in [
-                            (ThemePref::System, "시스템"),
-                            (ThemePref::Light, "밝게"),
-                            (ThemePref::Dark, "어둡게"),
+                        ui.label(t(Key::LblTheme));
+                        for (pref, key) in [
+                            (ThemePref::System, Key::ThemeSystem),
+                            (ThemePref::Light, Key::ThemeLight),
+                            (ThemePref::Dark, Key::ThemeDark),
                         ] {
-                            if ui.selectable_value(&mut st.theme, t, l).changed() {
+                            if ui.selectable_value(&mut st.theme, pref, t(key)).changed() {
                                 dirty = true;
-                                theme_changed = Some(t);
+                                theme_changed = Some(pref);
                             }
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(t(Key::LblLanguage));
+                        let cur = st.language;
+                        let mut sel = cur;
+                        egui::ComboBox::from_id_salt("lang")
+                            .width(170.0)
+                            .selected_text(match cur {
+                                Some(l) => l.native_name(),
+                                None => t(Key::LangSystem),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut sel, None, t(Key::LangSystem));
+                                for l in i18n::ALL_LANGS {
+                                    ui.selectable_value(&mut sel, Some(l), l.native_name());
+                                }
+                            });
+                        if sel != cur {
+                            st.language = sel;
+                            dirty = true;
+                            // 폰트까지 바꿔야 하므로 창을 그린 뒤에 한 번에 반영한다.
+                            lang_changed = Some(sel);
+                        }
+                    })
+                    .response
+                    .on_hover_text(t(Key::TipLanguage));
 
                     ui.add_space(10.0);
-                    ui.heading("도구 (yt-dlp / ffmpeg)");
-                    let t = self.tools.lock().unwrap().clone();
+                    ui.heading(t(Key::HdrTools));
+                    let tool_state = self.tools.lock().unwrap().clone();
 
                     ui.horizontal_wrapped(|ui| {
                         dirty |= ui
-                            .checkbox(&mut st.auto_update_check, "시작할 때 버전 확인")
-                            .on_hover_text("하루에 한 번 GitHub 릴리스와 비교합니다")
+                            .checkbox(&mut st.auto_update_check, t(Key::ChkAutoUpdateCheck))
+                            .on_hover_text(t(Key::TipAutoUpdateCheck))
                             .changed();
                         dirty |= ui
-                            .checkbox(&mut st.auto_update_tools, "새 버전이면 자동 적용")
-                            .on_hover_text("앱이 관리하는 복사본에만 적용됩니다")
+                            .checkbox(&mut st.auto_update_tools, t(Key::ChkAutoUpdateTools))
+                            .on_hover_text(t(Key::TipAutoUpdateTools))
                             .changed();
                         dirty |= ui
-                            .checkbox(&mut st.auto_install_ffmpeg, "ffmpeg 없으면 자동 설치")
+                            .checkbox(&mut st.auto_install_ffmpeg, t(Key::ChkAutoInstallFfmpeg))
                             .changed();
                     });
                     ui.add_space(4.0);
 
-                    egui::Grid::new("g_bin").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        // ── yt-dlp ──────────────────────
-                        ui.label("yt-dlp 실행 파일");
-                        ui.horizontal(|ui| {
-                            for (m, l) in [
-                                (BinMode::Managed, "앱이 관리 (권장)"),
-                                (BinMode::System, "시스템 설치본"),
-                                (BinMode::Custom, "직접 지정"),
-                            ] {
-                                if ui.selectable_value(&mut st.bin_mode, m, l).changed() {
-                                    dirty = true;
-                                    reprobe = true;
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        if st.bin_mode == BinMode::Custom {
-                            ui.label("yt-dlp 경로");
+                    egui::Grid::new("g_bin")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            // ── yt-dlp ──────────────────────
+                            ui.label(t(Key::LblYtdlpBinary));
                             ui.horizontal(|ui| {
-                                if ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut st.ytdlp_custom_path)
-                                            .desired_width(280.0),
-                                    )
-                                    .changed()
-                                {
-                                    dirty = true;
-                                    reprobe = true;
-                                }
-                                if ui.small_button("찾기").clicked() {
-                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                        st.ytdlp_custom_path = p.display().to_string();
+                                for (m, key) in [
+                                    (BinMode::Managed, Key::BinManaged),
+                                    (BinMode::System, Key::BinSystem),
+                                    (BinMode::Custom, Key::BinCustom),
+                                ] {
+                                    if ui.selectable_value(&mut st.bin_mode, m, t(key)).changed() {
                                         dirty = true;
                                         reprobe = true;
                                     }
                                 }
                             });
                             ui.end_row();
-                        }
 
-                        ui.label("yt-dlp 상태");
-                        ui.vertical(|ui| {
-                            tool_status_line(ui, &t.ytdlp);
-                            ui.horizontal(|ui| {
-                                let label = if st.bin_mode == BinMode::Managed {
-                                    "지금 설치 / 업데이트"
-                                } else {
-                                    "yt-dlp -U 실행"
-                                };
-                                if ui.add_enabled(!t.ytdlp.busy, egui::Button::new(label)).clicked() {
-                                    do_install_yt = true;
-                                }
-                                if ui.add_enabled(!t.ytdlp.busy, egui::Button::new("최신 확인")).clicked() {
-                                    do_check = true;
-                                }
-                            });
-                        });
-                        ui.end_row();
-
-                        // ── ffmpeg ──────────────────────
-                        ui.label("ffmpeg 경로");
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut st.ffmpeg_custom_path)
-                                        .desired_width(280.0)
-                                        .hint_text("비워 두면 자동 탐색 (앱 관리본 → 시스템 순)"),
-                                )
-                                .changed()
-                            {
-                                dirty = true;
-                                reprobe = true;
+                            if st.bin_mode == BinMode::Custom {
+                                ui.label(t(Key::LblYtdlpPath));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut st.ytdlp_custom_path)
+                                                .desired_width(280.0),
+                                        )
+                                        .changed()
+                                    {
+                                        dirty = true;
+                                        reprobe = true;
+                                    }
+                                    if ui.small_button(t(Key::BtnBrowse)).clicked() {
+                                        if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                            st.ytdlp_custom_path = p.display().to_string();
+                                            dirty = true;
+                                            reprobe = true;
+                                        }
+                                    }
+                                });
+                                ui.end_row();
                             }
-                            if ui.small_button("찾기").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                    st.ffmpeg_custom_path = p.display().to_string();
+
+                            ui.label(t(Key::LblYtdlpStatus));
+                            ui.vertical(|ui| {
+                                tool_status_line(ui, &tool_state.ytdlp);
+                                ui.horizontal(|ui| {
+                                    let label = if st.bin_mode == BinMode::Managed {
+                                        t(Key::BtnInstallUpdateNow)
+                                    } else {
+                                        t(Key::BtnRunYtdlpU)
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            !tool_state.ytdlp.busy,
+                                            egui::Button::new(label),
+                                        )
+                                        .clicked()
+                                    {
+                                        do_install_yt = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !tool_state.ytdlp.busy,
+                                            egui::Button::new(t(Key::BtnCheckLatest)),
+                                        )
+                                        .clicked()
+                                    {
+                                        do_check = true;
+                                    }
+                                });
+                            });
+                            ui.end_row();
+
+                            // ── ffmpeg ──────────────────────
+                            ui.label(t(Key::LblFfmpegPath));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut st.ffmpeg_custom_path)
+                                            .desired_width(280.0)
+                                            .hint_text(t(Key::HintFfmpegPath)),
+                                    )
+                                    .changed()
+                                {
                                     dirty = true;
                                     reprobe = true;
                                 }
-                            }
-                        });
-                        ui.end_row();
+                                if ui.small_button(t(Key::BtnBrowse)).clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        st.ffmpeg_custom_path = p.display().to_string();
+                                        dirty = true;
+                                        reprobe = true;
+                                    }
+                                }
+                            });
+                            ui.end_row();
 
-                        ui.label("ffmpeg 상태");
-                        ui.vertical(|ui| {
-                            tool_status_line(ui, &t.ffmpeg);
-                            if t.ffmpeg.local.is_none() {
-                                if let Some(bad) = tools::broken_ffmpeg(&st) {
+                            ui.label(t(Key::LblFfmpegStatus));
+                            ui.vertical(|ui| {
+                                tool_status_line(ui, &tool_state.ffmpeg);
+                                if tool_state.ffmpeg.local.is_none() {
+                                    if let Some(bad) = tools::broken_ffmpeg(&st) {
+                                        ui.label(
+                                            RichText::new(tf(
+                                                Key::MsgFfmpegBroken,
+                                                &[&bad.display().to_string()],
+                                            ))
+                                            .small()
+                                            .color(Color32::from_rgb(220, 110, 110)),
+                                        );
+                                    }
                                     ui.label(
-                                        RichText::new(format!(
-                                            "이 경로의 ffmpeg 이 실행되지 않습니다 (의존 라이브러리 손상 등): {}",
-                                            bad.display()
-                                        ))
-                                        .small()
-                                        .color(Color32::from_rgb(220, 110, 110)),
+                                        RichText::new(t(Key::MsgFfmpegMissingWarn))
+                                            .small()
+                                            .color(Color32::from_rgb(220, 150, 60)),
                                     );
                                 }
-                                ui.label(
-                                    RichText::new(
-                                        "ffmpeg 이 없으면 고화질 영상·오디오 병합, 오디오 변환, 썸네일 삽입이 제한됩니다.",
+                                if ui
+                                    .add_enabled(
+                                        !tool_state.ffmpeg.busy,
+                                        egui::Button::new(t(Key::BtnInstallUpdateNow)),
                                     )
-                                    .small()
-                                    .color(Color32::from_rgb(220, 150, 60)),
-                                );
-                            }
-                            if ui
-                                .add_enabled(!t.ffmpeg.busy, egui::Button::new("지금 설치 / 업데이트"))
-                                .on_hover_text("공식 정적 빌드(약 40MB)를 앱 폴더에 내려받습니다")
-                                .clicked()
-                            {
-                                do_install_ff = true;
-                            }
-                        });
-                        ui.end_row();
+                                    .on_hover_text(t(Key::TipInstallFfmpeg))
+                                    .clicked()
+                                {
+                                    do_install_ff = true;
+                                }
+                            });
+                            ui.end_row();
 
-                        ui.label("설치 위치");
-                        ui.label(
-                            RichText::new(crate::tools::managed_dir().display().to_string())
-                                .small()
-                                .weak(),
-                        );
-                        ui.end_row();
-                    });
+                            ui.label(t(Key::LblInstallDir));
+                            ui.label(
+                                RichText::new(crate::tools::managed_dir().display().to_string())
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.end_row();
+                        });
 
                     ui.add_space(10.0);
-                    ui.collapsing("고급", |ui| {
+                    ui.collapsing(t(Key::HdrAdvanced), |ui| {
                         dirty |= ui
-                            .checkbox(&mut st.ignore_yt_dlp_config, "yt-dlp 전역 설정 파일 무시 (--ignore-config)")
-                            .on_hover_text("여기 설정이 항상 그대로 적용되도록 합니다")
+                            .checkbox(&mut st.ignore_yt_dlp_config, t(Key::ChkIgnoreConfig))
+                            .on_hover_text(t(Key::TipIgnoreConfig))
                             .changed();
-                        ui.label("추가 인자");
+                        ui.label(t(Key::LblExtraArgs));
                         dirty |= ui
                             .add(
                                 egui::TextEdit::multiline(&mut st.extra_args)
                                     .desired_rows(2)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("예: --geo-bypass --force-ipv4"),
+                                    .hint_text(t(Key::HintExtraArgs)),
                             )
                             .changed();
                         ui.label(
-                            RichText::new(format!("설정 파일: {}", crate::config::config_path().display()))
-                                .small()
-                                .weak(),
+                            RichText::new(tf(
+                                Key::LblConfigFile,
+                                &[&crate::config::config_path().display().to_string()],
+                            ))
+                            .small()
+                            .weak(),
                         );
                     });
                 });
@@ -1307,8 +1473,11 @@ impl App {
         if dirty {
             self.save_settings();
         }
-        if let Some(t) = theme_changed {
-            apply_theme(ctx, t);
+        if let Some(pref) = theme_changed {
+            apply_theme(ctx, pref);
+        }
+        if let Some(pref) = lang_changed {
+            crate::util::install_fonts(ctx, i18n::apply_pref(pref));
         }
         if reprobe {
             self.refresh_tools();
@@ -1335,17 +1504,17 @@ impl App {
 fn tool_status_line(ui: &mut egui::Ui, st: &ToolState) {
     ui.horizontal(|ui| match &st.local {
         Some(v) => {
-            ui.label(RichText::new(format!("설치됨 {v}")).small());
+            ui.label(RichText::new(tf(Key::ToolInstalled, &[v])).small());
             if let Some(l) = st.latest_pretty() {
-                ui.label(RichText::new(format!("· 최신 {l}")).small().weak());
+                ui.label(RichText::new(tf(Key::ToolLatestIs, &[&l])).small().weak());
             }
             if !st.managed {
-                ui.label(RichText::new("· 시스템 설치본").small().weak());
+                ui.label(RichText::new(t(Key::ToolSystemCopy)).small().weak());
             }
         }
         None => {
             ui.label(
-                RichText::new("설치되지 않음")
+                RichText::new(t(Key::ToolNotInstalled))
                     .small()
                     .color(Color32::from_rgb(220, 90, 90)),
             );
@@ -1377,15 +1546,15 @@ fn url_input_id() -> egui::Id {
 }
 
 fn mode_label(m: Mode) -> &'static str {
-    match m {
-        Mode::Video => "영상",
-        Mode::Audio => "오디오",
-    }
+    t(match m {
+        Mode::Video => Key::LblVideo,
+        Mode::Audio => Key::LblAudio,
+    })
 }
 
 fn bitrate_label(v: &str) -> String {
     if v == "best" {
-        "최고 음질".to_string()
+        t(Key::AudioBest).to_string()
     } else {
         format!("{}kbps", v.trim_end_matches(['K', 'k']))
     }
@@ -1393,18 +1562,18 @@ fn bitrate_label(v: &str) -> String {
 
 fn height_label(h: u32) -> String {
     match h {
-        0 => "최고 화질".to_string(),
+        0 => t(Key::QualityBest).to_string(),
         2160 => "2160p (4K)".to_string(),
         1440 => "1440p (2K)".to_string(),
         v => format!("{v}p"),
     }
 }
 
-fn codec_label(c: &str) -> &str {
+fn codec_label(c: &str) -> &'static str {
     match c {
-        "h264" => "H.264 (호환성)",
-        "av1" => "AV1 (고효율)",
+        "h264" => t(Key::CodecH264),
+        "av1" => t(Key::CodecAv1),
         "vp9" => "VP9",
-        _ => "자동",
+        _ => t(Key::Auto),
     }
 }

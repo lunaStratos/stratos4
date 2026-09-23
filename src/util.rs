@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::i18n::Lang;
+
 /// 텍스트에서 http(s) URL 을 모두 추출한다. (클립보드 붙여넣기 처리용)
 pub fn find_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -208,44 +210,115 @@ pub fn reveal(path: &Path) {
     }
 }
 
-/// 한글이 네모로 깨지지 않도록 시스템 한글 폰트를 egui 에 주입한다.
-pub fn install_korean_font(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        // macOS
-        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-        "/Library/Fonts/NanumGothic.ttf",
-        // Windows
-        "C:\\Windows\\Fonts\\malgun.ttf",
-        "C:\\Windows\\Fonts\\MalgunGothic.ttf",
-        "C:\\Windows\\Fonts\\gulim.ttc",
-        // Linux
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ];
+/// 표시 언어의 문자가 네모로 깨지지 않도록 시스템 폰트를 egui 에 주입한다.
+///
+/// egui 기본 폰트는 라틴 문자만 담고 있어 한글·일본어·중국어·아랍 문자를 그리지 못한다.
+/// 대용량 CJK 폰트를 전부 올리면 메모리와 기동 시간이 커지므로,
+/// 표시 언어의 문자 + 영상 제목에서 흔한 보조 CJK 폰트까지 최대 2개만 얹는다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Korean,
+    Japanese,
+    Chinese,
+    Arabic,
+}
 
-    let Some((name, bytes)) = CANDIDATES.iter().find_map(|p| {
-        std::fs::read(p).ok().map(|b| {
-            (
-                Path::new(p)
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-                b,
-            )
-        })
-    }) else {
-        return;
+fn script_candidates(s: Script) -> &'static [&'static str] {
+    match s {
+        Script::Korean => &[
+            // macOS
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+            "/Library/Fonts/NanumGothic.ttf",
+            // Windows
+            "C:\\Windows\\Fonts\\malgun.ttf",
+            "C:\\Windows\\Fonts\\MalgunGothic.ttf",
+            "C:\\Windows\\Fonts\\gulim.ttc",
+            // Linux
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ],
+        Script::Japanese => &[
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Osaka.ttf",
+            "C:\\Windows\\Fonts\\YuGothM.ttc",
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "C:\\Windows\\Fonts\\msgothic.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        ],
+        Script::Chinese => &[
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ],
+        Script::Arabic => &[
+            "/System/Library/Fonts/SFArabic.ttf",
+            "/System/Library/Fonts/GeezaPro.ttc",
+            // 구형 macOS 는 Supplemental 아래에 둔다
+            "/System/Library/Fonts/Supplemental/GeezaPro.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "C:\\Windows\\Fonts\\tahoma.ttf",
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+    }
+}
+
+pub fn install_fonts(ctx: &egui::Context, lang: Lang) {
+    let primary = match lang {
+        Lang::Ko => Some(Script::Korean),
+        Lang::Ja => Some(Script::Japanese),
+        Lang::Zh => Some(Script::Chinese),
+        Lang::Ar => Some(Script::Arabic),
+        _ => None,
     };
 
+    // 표시 언어의 문자를 먼저, 그다음 제목 표시용 보조 CJK 폰트를 하나 더.
+    let mut wanted: Vec<Script> = primary.into_iter().collect();
+    for s in [Script::Korean, Script::Japanese, Script::Chinese] {
+        if wanted.len() >= 2 {
+            break;
+        }
+        if !wanted.contains(&s) {
+            wanted.push(s);
+        }
+    }
+
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        name.clone(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-    );
+    let mut added: Vec<String> = Vec::new();
+    for script in wanted {
+        let Some((name, bytes)) = script_candidates(script).iter().find_map(|p| {
+            let name = Path::new(p).file_stem()?.to_string_lossy().to_string();
+            // 같은 파일이 여러 문자의 후보로 올라와 있을 수 있다 (Noto CJK 등).
+            if added.contains(&name) {
+                return None;
+            }
+            std::fs::read(p).ok().map(|b| (name, b))
+        }) else {
+            continue;
+        };
+        fonts.font_data.insert(
+            name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        added.push(name);
+    }
+    if added.is_empty() {
+        return;
+    }
+
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push(name.clone());
+        let list = fonts.families.entry(family).or_default();
+        list.extend(added.iter().cloned());
     }
     ctx.set_fonts(fonts);
 }

@@ -12,6 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local};
 
 use crate::config::{PlaylistMode, Settings};
+use crate::i18n::{t, tf, Key};
 use crate::util::new_command;
 use crate::{tools, util};
 
@@ -34,14 +35,14 @@ pub enum Status {
 
 impl Status {
     pub fn label(&self) -> &'static str {
-        match self {
-            Status::Queued => "대기",
-            Status::Running => "진행 중",
-            Status::Paused => "일시정지",
-            Status::Done => "완료",
-            Status::Failed => "실패",
-            Status::Canceled => "취소됨",
-        }
+        t(match self {
+            Status::Queued => Key::StQueued,
+            Status::Running => Key::StRunning,
+            Status::Paused => Key::StPaused,
+            Status::Done => Key::StDone,
+            Status::Failed => Key::StFailed,
+            Status::Canceled => Key::StCanceled,
+        })
     }
     pub fn is_active(&self) -> bool {
         matches!(self, Status::Queued | Status::Running)
@@ -175,14 +176,14 @@ impl Engine {
 
         let mut job = if is_playlist && pl_mode == PlaylistMode::Expand {
             let mut j = Job::new(self.new_id(), url.to_string(), JobKind::Resolve);
-            j.title = "플레이리스트 해석 중...".into();
-            j.stage = "목록 읽는 중".into();
+            j.title = t(Key::JobResolving).into();
+            j.stage = t(Key::StageReadingList).into();
             j
         } else {
             let mut j = Job::new(self.new_id(), url.to_string(), JobKind::Download);
             j.playlist_single = is_playlist && pl_mode == PlaylistMode::Single;
             if j.playlist_single {
-                j.title = "플레이리스트".into();
+                j.title = t(Key::TitlePlaylist).into();
             }
             j
         };
@@ -417,10 +418,7 @@ fn prepare(jobs: &Jobs, id: u64, st: &Settings) -> Option<(PathBuf, bool, Option
     let Some(bin) = tools::resolve(st) else {
         with_job(jobs, id, |j| {
             j.status = Status::Failed;
-            j.error = Some(
-                "yt-dlp 실행 파일을 찾을 수 없습니다. 설정 → yt-dlp 에서 '지금 설치/업데이트'를 눌러 주세요."
-                    .into(),
-            );
+            j.error = Some(t(Key::ErrYtdlpNotFoundHint).into());
             j.finished_at = Some(Local::now());
         });
         return None;
@@ -450,10 +448,10 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
     args.push(url.clone());
 
     with_job(&jobs, id, |j| {
-        j.stage = "시작 중".into();
+        j.stage = t(Key::StageStarting).into();
         j.speed = 0.0;
         if !have_ffmpeg {
-            j.push_log("[알림] ffmpeg 를 찾지 못해 단일 파일 포맷으로 내려받습니다. 최고 화질은 제한될 수 있습니다.");
+            j.push_log(t(Key::LogNoFfmpeg));
         }
         j.push_log(format!("$ {} {}", bin.display(), args.join(" ")));
     });
@@ -471,7 +469,7 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
         Err(e) => {
             with_job(&jobs, id, |j| {
                 j.status = Status::Failed;
-                j.error = Some(format!("실행 실패: {e}"));
+                j.error = Some(tf(Key::ErrSpawnFailed, &[&e.to_string()]));
                 j.finished_at = Some(Local::now());
             });
             ctx.request_repaint();
@@ -524,14 +522,14 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
         j.finished_at = Some(Local::now());
         if abort_code == ABORT_PAUSE {
             j.status = Status::Paused;
-            j.stage = "일시정지 (재개하면 이어받기)".into();
+            j.stage = t(Key::StagePausedResumable).into();
         } else if abort_code == ABORT_CANCEL {
             j.status = Status::Canceled;
             j.stage.clear();
         } else if status.map(|s| s.success()).unwrap_or(false) {
             j.status = Status::Done;
             j.progress = 1.0;
-            j.stage = "완료".into();
+            j.stage = t(Key::StDone).into();
         } else {
             j.status = Status::Failed;
             j.stage.clear();
@@ -542,7 +540,7 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
                         .rev()
                         .find(|l| l.contains("ERROR"))
                         .cloned()
-                        .unwrap_or_else(|| "알 수 없는 오류로 종료되었습니다.".into()),
+                        .unwrap_or_else(|| t(Key::ErrUnknownExit).into()),
                 );
             }
         }
@@ -616,7 +614,7 @@ fn run_resolve(
         Err(e) => {
             with_job(&jobs, id, |j| {
                 j.status = Status::Failed;
-                j.error = Some(format!("실행 실패: {e}"));
+                j.error = Some(tf(Key::ErrSpawnFailed, &[&e.to_string()]));
                 j.finished_at = Some(Local::now());
             });
             ctx.request_repaint();
@@ -669,7 +667,7 @@ fn run_resolve(
             j.status = Status::Failed;
             j.finished_at = Some(Local::now());
             if j.error.is_none() {
-                j.error = Some("플레이리스트 정보를 읽지 못했습니다.".into());
+                j.error = Some(t(Key::ErrPlaylistReadFailed).into());
             }
         });
         ctx.request_repaint();
@@ -679,7 +677,7 @@ fn run_resolve(
     let list_title = root
         .get("title")
         .and_then(|v| v.as_str())
-        .unwrap_or("플레이리스트")
+        .unwrap_or(t(Key::TitlePlaylist))
         .to_string();
 
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -708,7 +706,7 @@ fn run_resolve(
             p.status = Status::Done;
             p.progress = 1.0;
             p.title = list_title;
-            p.stage = "단일 영상".into();
+            p.stage = t(Key::StageSingleVideo).into();
             p.finished_at = Some(Local::now());
         }
         drop(g);
@@ -762,9 +760,12 @@ fn run_resolve(
             p.progress = 1.0;
             p.title = list_title;
             p.stage = if truncated {
-                format!("{added}개 추가 (설정 상한 {limit}개로 잘림)")
+                tf(
+                    Key::StageAddedTruncated,
+                    &[&added.to_string(), &limit.to_string()],
+                )
             } else {
-                format!("{added}개 항목 추가")
+                tf(Key::StageAddedItems, &[&added.to_string()])
             };
             p.finished_at = Some(Local::now());
         }
@@ -904,9 +905,9 @@ fn handle_line(jobs: &Jobs, id: u64, playlist_single: bool, line: &str) {
                 };
             }
             j.stage = match p[0] {
-                "finished" => "병합/후처리 대기".into(),
-                "error" => "오류".into(),
-                _ => "다운로드 중".into(),
+                "finished" => t(Key::StageMergeWaiting).into(),
+                "error" => t(Key::StageError).into(),
+                _ => t(Key::StageDownloading).into(),
             };
         });
         return;
@@ -918,9 +919,9 @@ fn handle_line(jobs: &Jobs, id: u64, playlist_single: bool, line: &str) {
         let pp = it.next().unwrap_or("");
         with_job(jobs, id, |j| {
             j.stage = match (status, pp) {
-                ("finished", _) => "후처리 완료".into(),
-                (_, p) if !p.is_empty() && p != "NA" => format!("후처리: {p}"),
-                _ => "후처리 중".into(),
+                ("finished", _) => t(Key::StagePostDone).into(),
+                (_, p) if !p.is_empty() && p != "NA" => tf(Key::StagePostNamed, &[p]),
+                _ => t(Key::StagePost).into(),
             };
         });
         return;

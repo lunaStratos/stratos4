@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{app_dir, BinMode, Settings};
+use crate::i18n::{t, tf, Key};
 use crate::util::{new_command, which};
 
 pub const YTDLP_REPO: &str = "yt-dlp/yt-dlp";
@@ -108,7 +109,7 @@ fn download_to(
     let mut resp = ureq::get(url)
         .header("User-Agent", UA)
         .call()
-        .with_context(|| format!("내려받기 실패: {url}"))?;
+        .with_context(|| tf(Key::ErrDownloadFailed, &[url]))?;
 
     let total: u64 = resp
         .headers()
@@ -123,7 +124,7 @@ fn download_to(
     let tmp = dest.with_extension("part");
     {
         let mut file =
-            std::io::BufWriter::new(std::fs::File::create(&tmp).context("임시 파일 생성 실패")?);
+            std::io::BufWriter::new(std::fs::File::create(&tmp).context(t(Key::ErrTempFile))?);
         let counting = Counting {
             inner: resp.body_mut().as_reader(),
             got: 0,
@@ -133,10 +134,10 @@ fn download_to(
         };
         if gunzip {
             let mut gz = flate2::read::GzDecoder::new(counting);
-            std::io::copy(&mut gz, &mut file).context("압축 해제 실패")?;
+            std::io::copy(&mut gz, &mut file).context(t(Key::ErrGunzip))?;
         } else {
             let mut r = counting;
-            std::io::copy(&mut r, &mut file).context("파일 쓰기 실패")?;
+            std::io::copy(&mut r, &mut file).context(t(Key::ErrFileWrite))?;
         }
     }
 
@@ -148,7 +149,7 @@ fn download_to(
             let _ = std::fs::remove_file(dest);
         }
     }
-    std::fs::rename(&tmp, dest).context("실행 파일 교체 실패")?;
+    std::fs::rename(&tmp, dest).context(t(Key::ErrReplaceBinary))?;
     make_executable(dest);
     Ok(())
 }
@@ -177,15 +178,15 @@ fn latest_tag(repo: &str) -> Result<String> {
         .header("User-Agent", UA)
         .header("Accept", "application/vnd.github+json")
         .call()
-        .context("GitHub 릴리스 조회 실패")?
+        .context(t(Key::ErrGithubRelease))?
         .body_mut()
         .read_to_string()
-        .context("응답 본문 읽기 실패")?;
+        .context(t(Key::ErrReadBody))?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     v.get("tag_name")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("tag_name 없음"))
+        .ok_or_else(|| anyhow!(t(Key::ErrNoTagName)))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ pub fn install_ytdlp(progress: &mut dyn FnMut(u64, u64)) -> Result<(String, Stri
     );
     let dest = ytdlp_managed_path();
     download_to(&url, &dest, false, progress)?;
-    let ver = ytdlp_version(&dest).ok_or_else(|| anyhow!("설치했지만 실행에 실패했습니다"))?;
+    let ver = ytdlp_version(&dest).ok_or_else(|| anyhow!(t(Key::ErrInstalledButFailed)))?;
     set_installed_tag("yt-dlp", &tag);
     Ok((ver, tag))
 }
@@ -259,7 +260,7 @@ pub fn ytdlp_self_update(bin: &Path) -> Result<String> {
     let out = new_command(bin)
         .arg("-U")
         .output()
-        .context("yt-dlp -U 실행 실패")?;
+        .context(t(Key::ErrYtdlpUFailed))?;
     let mut msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !err.is_empty() {
@@ -392,7 +393,7 @@ pub fn ffmpeg_latest() -> Result<String> {
 
 /// 관리형 ffmpeg + ffprobe 를 내려받는다. (합계 약 40~55MB)
 pub fn install_ffmpeg(progress: &mut dyn FnMut(u64, u64, &str)) -> Result<(String, String)> {
-    let (ff, fp) = ffmpeg_assets().ok_or_else(|| anyhow!("이 플랫폼용 ffmpeg 빌드가 없습니다"))?;
+    let (ff, fp) = ffmpeg_assets().ok_or_else(|| anyhow!(t(Key::ErrNoFfmpegBuild)))?;
     let tag = latest_tag(FFMPEG_REPO)?;
     let base = format!("https://github.com/{FFMPEG_REPO}/releases/download/{tag}");
 
@@ -409,7 +410,7 @@ pub fn install_ffmpeg(progress: &mut dyn FnMut(u64, u64, &str)) -> Result<(Strin
     );
 
     clear_ffmpeg_cache();
-    let ver = ffmpeg_version(&dest).ok_or_else(|| anyhow!("설치했지만 실행에 실패했습니다"))?;
+    let ver = ffmpeg_version(&dest).ok_or_else(|| anyhow!(t(Key::ErrInstalledButFailed)))?;
     set_installed_tag("ffmpeg", &tag);
     Ok((ver, tag))
 }
@@ -522,7 +523,7 @@ pub fn spawn_startup_check(
         } else if settings.auto_update_check || force {
             set_ytdlp(&tools, &ctx, |s| {
                 s.busy = true;
-                s.message = "최신 버전 확인 중...".into();
+                s.message = t(Key::MsgCheckingLatest).into();
             });
             match ytdlp_latest() {
                 Ok(v) => {
@@ -538,16 +539,16 @@ pub fn spawn_startup_check(
                     } else {
                         set_ytdlp(&tools, &ctx, |s| {
                             s.message = if outdated {
-                                format!("새 버전 {} 이(가) 있습니다", pretty_tag(&v))
+                                tf(Key::MsgNewVersion, &[&pretty_tag(&v)])
                             } else {
-                                "최신 버전입니다".into()
+                                t(Key::MsgUpToDate).into()
                             };
                         });
                     }
                 }
                 Err(e) => set_ytdlp(&tools, &ctx, |s| {
                     s.busy = false;
-                    s.message = format!("확인 실패: {e}");
+                    s.message = tf(Key::MsgCheckFailed, &[&e.to_string()]);
                 }),
             }
         }
@@ -571,13 +572,13 @@ pub fn spawn_startup_check(
                 do_install_ffmpeg(&tools, &ctx);
             } else {
                 set_ffmpeg(&tools, &ctx, |s| {
-                    s.message = "ffmpeg 이 없어 고화질 병합·오디오 변환이 제한됩니다".into();
+                    s.message = t(Key::MsgFfmpegLimited).into();
                 });
             }
         } else if ff_managed && (settings.auto_update_check || force) {
             set_ffmpeg(&tools, &ctx, |s| {
                 s.busy = true;
-                s.message = "최신 버전 확인 중...".into();
+                s.message = t(Key::MsgCheckingLatest).into();
             });
             match ffmpeg_latest() {
                 Ok(v) => {
@@ -593,16 +594,16 @@ pub fn spawn_startup_check(
                     } else {
                         set_ffmpeg(&tools, &ctx, |s| {
                             s.message = if outdated {
-                                format!("새 버전 {} 이(가) 있습니다", pretty_tag(&v))
+                                tf(Key::MsgNewVersion, &[&pretty_tag(&v)])
                             } else {
-                                "최신 버전입니다".into()
+                                t(Key::MsgUpToDate).into()
                             };
                         });
                     }
                 }
                 Err(e) => set_ffmpeg(&tools, &ctx, |s| {
                     s.busy = false;
-                    s.message = format!("확인 실패: {e}");
+                    s.message = tf(Key::MsgCheckFailed, &[&e.to_string()]);
                 }),
             }
         } else {
@@ -614,7 +615,7 @@ pub fn spawn_startup_check(
 fn do_install_ytdlp(tools: &SharedTools, ctx: &egui::Context) {
     set_ytdlp(tools, ctx, |s| {
         s.busy = true;
-        s.message = "yt-dlp 내려받는 중...".into();
+        s.message = t(Key::MsgDownloadingYtdlp).into();
         s.progress = Some((0, 0, "yt-dlp".into()));
     });
     let t = tools.clone();
@@ -628,14 +629,14 @@ fn do_install_ytdlp(tools: &SharedTools, ctx: &egui::Context) {
         s.progress = None;
         match result {
             Ok((ver, tag)) => {
-                s.message = format!("yt-dlp {ver} 적용 완료");
+                s.message = tf(Key::MsgApplied, &["yt-dlp", &ver]);
                 s.local = Some(ver);
                 s.installed = Some(tag.clone());
                 s.latest = Some(tag);
                 s.path = Some(ytdlp_managed_path());
                 s.managed = true;
             }
-            Err(e) => s.message = format!("설치 실패: {e}"),
+            Err(e) => s.message = tf(Key::MsgInstallFailed, &[&e.to_string()]),
         }
     });
 }
@@ -643,7 +644,7 @@ fn do_install_ytdlp(tools: &SharedTools, ctx: &egui::Context) {
 fn do_install_ffmpeg(tools: &SharedTools, ctx: &egui::Context) {
     set_ffmpeg(tools, ctx, |s| {
         s.busy = true;
-        s.message = "ffmpeg 내려받는 중... (약 40MB)".into();
+        s.message = t(Key::MsgDownloadingFfmpeg).into();
         s.progress = Some((0, 0, "ffmpeg".into()));
     });
     let t = tools.clone();
@@ -657,14 +658,14 @@ fn do_install_ffmpeg(tools: &SharedTools, ctx: &egui::Context) {
         s.progress = None;
         match result {
             Ok((ver, tag)) => {
-                s.message = format!("ffmpeg {ver} 적용 완료");
+                s.message = tf(Key::MsgApplied, &["ffmpeg", &ver]);
                 s.local = Some(ver);
                 s.installed = Some(tag.clone());
                 s.latest = Some(tag);
                 s.path = Some(ffmpeg_managed_path());
                 s.managed = true;
             }
-            Err(e) => s.message = format!("설치 실패: {e}"),
+            Err(e) => s.message = tf(Key::MsgInstallFailed, &[&e.to_string()]),
         }
     });
 }
@@ -677,21 +678,22 @@ pub fn spawn_install_ytdlp(tools: SharedTools, settings: Settings, ctx: egui::Co
         } else {
             set_ytdlp(&tools, &ctx, |s| {
                 s.busy = true;
-                s.message = "yt-dlp -U 실행 중...".into();
+                s.message = t(Key::MsgRunningYtdlpU).into();
             });
             let r = match resolve(&settings) {
-                Some(bin) => ytdlp_self_update(&bin)
-                    .and_then(|_| ytdlp_version(&bin).ok_or_else(|| anyhow!("버전 확인 실패"))),
-                None => Err(anyhow!("yt-dlp 실행 파일을 찾을 수 없습니다")),
+                Some(bin) => ytdlp_self_update(&bin).and_then(|_| {
+                    ytdlp_version(&bin).ok_or_else(|| anyhow!(t(Key::ErrVersionCheckFailed)))
+                }),
+                None => Err(anyhow!(t(Key::ErrYtdlpBinNotFound))),
             };
             set_ytdlp(&tools, &ctx, |s| {
                 s.busy = false;
                 match r {
                     Ok(v) => {
-                        s.message = format!("yt-dlp {v} 적용 완료");
+                        s.message = tf(Key::MsgApplied, &["yt-dlp", &v]);
                         s.local = Some(v);
                     }
-                    Err(e) => s.message = format!("업데이트 실패: {e}"),
+                    Err(e) => s.message = tf(Key::MsgUpdateFailed, &[&e.to_string()]),
                 }
             });
         }

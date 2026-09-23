@@ -29,6 +29,10 @@ quality, and playlist handling without opening the settings window.
 - **Automatic yt-dlp / ffmpeg management** — on startup the app checks whether they are
   installed and whether a newer release exists, downloads them if missing, and updates them
   when a new version appears. Nothing has to be installed system-wide.
+- **Multilingual UI** — English, Japanese, Korean, Simplified Chinese, Arabic, German, French,
+  Spanish, and Portuguese. It follows the OS display language by default and can be changed
+  under `Settings → Language`, taking effect immediately. System fonts covering the selected
+  language's script are loaded automatically.
 - **Pause / resume** — pausing leaves the partial file behind, so restarting continues where
   it left off.
 - Configurable concurrent downloads, concurrent fragments, rate limit, proxy, browser cookies,
@@ -37,6 +41,7 @@ quality, and playlist handling without opening the settings window.
 
 ## Version history
 
+- **1.1** — nine-language UI (English / Japanese / Korean / Chinese / Arabic / German / French / Spanish / Portuguese)
 - **1.0** — downloading confirmed working
 
 ## Building

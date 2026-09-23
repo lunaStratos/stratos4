@@ -3,14 +3,18 @@
 mod app;
 mod config;
 mod engine;
+mod i18n;
 mod tools;
 mod util;
 
 use crate::config::Settings;
+use crate::i18n::{apply_pref, t, tf, Key};
 
 fn main() -> eframe::Result<()> {
     // GUI 없이 도구 상태만 확인/설치하는 보조 모드 (문제 해결·CI 용)
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // CLI 출력도 저장된 표시 언어를 따른다. (GUI 는 App::new 에서 다시 확정한다)
+    apply_pref(Settings::load().language);
     match args.first().map(|s| s.as_str()) {
         Some("--check-tools") => {
             cli_check();
@@ -25,10 +29,7 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
         Some("-h" | "--help") => {
-            println!(
-                "stratos4 YT Downloader {}\n\n  (인자 없음)        GUI 실행\n  --check-tools    yt-dlp/ffmpeg 설치 상태와 최신 버전 확인\n  --install-tools  yt-dlp/ffmpeg 최신판을 앱 폴더에 설치\n  --download URL…  GUI 없이 저장된 설정 그대로 내려받기",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("{}", tf(Key::CliHelp, &[env!("CARGO_PKG_VERSION")]));
             return Ok(());
         }
         _ => {}
@@ -61,7 +62,7 @@ fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
     match eframe::icon_data::from_png_bytes(ICON_PNG) {
         Ok(icon) => Some(std::sync::Arc::new(icon)),
         Err(e) => {
-            eprintln!("아이콘을 불러오지 못했습니다: {e}");
+            eprintln!("{}", tf(Key::CliIconLoadFailed, &[&e.to_string()]));
             None
         }
     }
@@ -69,38 +70,58 @@ fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
 
 fn cli_check() {
     let st = Settings::load();
-    println!("설치 위치: {}", tools::managed_dir().display());
+    println!(
+        "{}",
+        tf(
+            Key::CliInstallDir,
+            &[&tools::managed_dir().display().to_string()]
+        )
+    );
 
     match tools::resolve(&st) {
         Some(p) => println!(
             "yt-dlp  : {}  ({})",
-            tools::ytdlp_version(&p).unwrap_or_else(|| "실행 실패".into()),
+            tools::ytdlp_version(&p).unwrap_or_else(|| t(Key::CliRunFailed).into()),
             p.display()
         ),
-        None => println!("yt-dlp  : 없음"),
+        None => println!("yt-dlp  : {}", t(Key::CliNone)),
     }
     match tools::resolve_ffmpeg(&st) {
         Some(p) => println!(
             "ffmpeg  : {}  ({})",
-            tools::ffmpeg_version(&p).unwrap_or_else(|| "실행 실패".into()),
+            tools::ffmpeg_version(&p).unwrap_or_else(|| t(Key::CliRunFailed).into()),
             p.display()
         ),
         None => {
-            println!("ffmpeg  : 없음");
+            println!("ffmpeg  : {}", t(Key::CliNone));
             if let Some(b) = tools::broken_ffmpeg(&st) {
-                println!("          (실행 불가 파일 발견: {})", b.display());
+                println!(
+                    "          {}",
+                    tf(Key::CliBrokenFound, &[&b.display().to_string()])
+                );
             }
         }
     }
     println!(
-        "설치 태그: yt-dlp {} / ffmpeg {}",
-        tools::installed_tag("yt-dlp").unwrap_or_else(|| "기록 없음".into()),
-        tools::installed_tag("ffmpeg").unwrap_or_else(|| "기록 없음".into())
+        "{}",
+        tf(
+            Key::CliInstalledTags,
+            &[
+                &tools::installed_tag("yt-dlp").unwrap_or_else(|| t(Key::CliNoRecord).into()),
+                &tools::installed_tag("ffmpeg").unwrap_or_else(|| t(Key::CliNoRecord).into()),
+            ]
+        )
     );
+    let fail = |e: anyhow::Error| tf(Key::CliCheckFailed, &[&e.to_string()]);
     println!(
-        "최신 태그: yt-dlp {} / ffmpeg {}",
-        tools::ytdlp_latest().unwrap_or_else(|e| format!("확인 실패 ({e})")),
-        tools::ffmpeg_latest().unwrap_or_else(|e| format!("확인 실패 ({e})"))
+        "{}",
+        tf(
+            Key::CliLatestTags,
+            &[
+                &tools::ytdlp_latest().unwrap_or_else(fail),
+                &tools::ffmpeg_latest().unwrap_or_else(fail),
+            ]
+        )
     );
 }
 
@@ -124,13 +145,13 @@ fn bar(label: &'static str) -> impl FnMut(u64, u64) {
 }
 
 fn cli_install() {
-    println!("yt-dlp 설치 중...");
+    println!("{}", tf(Key::CliInstalling, &["yt-dlp"]));
     match tools::install_ytdlp(&mut bar("yt-dlp")) {
-        Ok((v, tag)) => println!("yt-dlp {v} 설치 완료 (릴리스 {tag})"),
-        Err(e) => eprintln!("yt-dlp 설치 실패: {e}"),
+        Ok((v, tag)) => println!("{}", tf(Key::CliInstalledOk, &["yt-dlp", &v, &tag])),
+        Err(e) => eprintln!("{}", tf(Key::CliInstallFailed, &["yt-dlp", &e.to_string()])),
     }
 
-    println!("ffmpeg 설치 중...");
+    println!("{}", tf(Key::CliInstalling, &["ffmpeg"]));
     let mut ff = bar("ffmpeg");
     let mut fp = bar("ffprobe");
     match tools::install_ffmpeg(&mut |got, total, which| {
@@ -140,8 +161,8 @@ fn cli_install() {
             fp(got, total)
         }
     }) {
-        Ok((v, tag)) => println!("ffmpeg {v} 설치 완료 (릴리스 {tag})"),
-        Err(e) => eprintln!("ffmpeg 설치 실패: {e}"),
+        Ok((v, tag)) => println!("{}", tf(Key::CliInstalledOk, &["ffmpeg", &v, &tag])),
+        Err(e) => eprintln!("{}", tf(Key::CliInstallFailed, &["ffmpeg", &e.to_string()])),
     }
 }
 
@@ -151,12 +172,18 @@ fn cli_download(urls: &[String]) {
     use std::sync::{Arc, Mutex};
 
     if urls.is_empty() {
-        eprintln!("사용법: stratos-dl --download <URL> [URL...]");
+        eprintln!("{}", t(Key::CliUsageDownload));
         return;
     }
 
     let settings = Settings::load();
-    println!("저장 폴더: {}", settings.download_dir.display());
+    println!(
+        "{}",
+        tf(
+            Key::CliSaveFolder,
+            &[&settings.download_dir.display().to_string()]
+        )
+    );
 
     let ctx = egui::Context::default();
     let engine = Engine::new(ctx, Arc::new(Mutex::new(settings)));
@@ -204,7 +231,10 @@ fn cli_download(urls: &[String]) {
     let jobs = engine.jobs.lock().unwrap();
     let ok = jobs.iter().filter(|j| j.status == Status::Done).count();
     let bad = jobs.iter().filter(|j| j.status == Status::Failed).count();
-    println!("\n완료 {ok} / 실패 {bad}");
+    println!(
+        "\n{}",
+        tf(Key::CliSummary, &[&ok.to_string(), &bad.to_string()])
+    );
     for j in jobs.iter() {
         if let Some(p) = &j.filepath {
             println!("  → {}", p.display());
