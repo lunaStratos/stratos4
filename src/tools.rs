@@ -16,6 +16,8 @@ use crate::util::{new_command, which};
 pub const YTDLP_REPO: &str = "yt-dlp/yt-dlp";
 /// 플랫폼별 단일 실행 파일(gzip)을 제공해 압축 해제만으로 설치가 끝난다.
 pub const FFMPEG_REPO: &str = "eugeneware/ffmpeg-static";
+/// YouTube 의 JS challenge 를 풀기 위해 yt-dlp 가 쓰는 JavaScript 런타임
+pub const DENO_REPO: &str = "denoland/deno";
 const UA: &str = concat!("stratos-dl/", env!("CARGO_PKG_VERSION"));
 
 pub fn managed_dir() -> PathBuf {
@@ -416,6 +418,133 @@ pub fn install_ffmpeg(progress: &mut dyn FnMut(u64, u64, &str)) -> Result<(Strin
 }
 
 // ─────────────────────────────────────────────────────────────
+// JavaScript 런타임 (Deno / Node / Bun)
+// ─────────────────────────────────────────────────────────────
+//
+// yt-dlp 는 YouTube 의 "n challenge" 를 풀 때 외부 JS 런타임이 필요하다.
+// 없으면 형식이 대부분 빠져 "Requested format is not available" 로 실패한다.
+// .app 번들은 PATH 가 빈약해 Homebrew 의 deno 도 못 찾으므로 경로를 직접 넘긴다.
+
+/// 관리형 Deno 배포 파일명. 지원하지 않는 플랫폼이면 None.
+pub fn deno_asset() -> Option<&'static str> {
+    let arm = std::env::consts::ARCH == "aarch64";
+    Some(if cfg!(target_os = "macos") {
+        if arm {
+            "deno-aarch64-apple-darwin.zip"
+        } else {
+            "deno-x86_64-apple-darwin.zip"
+        }
+    } else if cfg!(target_os = "windows") {
+        "deno-x86_64-pc-windows-msvc.zip"
+    } else if cfg!(target_os = "linux") {
+        if arm {
+            "deno-aarch64-unknown-linux-gnu.zip"
+        } else {
+            "deno-x86_64-unknown-linux-gnu.zip"
+        }
+    } else {
+        return None;
+    })
+}
+
+pub fn deno_managed_path() -> PathBuf {
+    managed_dir().join(exe("deno"))
+}
+
+/// `deno --version` → "2.9.5", `node --version` → "22.1.0", `bun --version` → "1.2.0"
+pub fn js_version(path: &Path) -> Option<String> {
+    let out = new_command(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let first = s.lines().next()?.trim();
+    // "deno 2.9.5 (stable, ...)" / "v22.1.0" / "1.2.0"
+    let v = first
+        .strip_prefix("deno ")
+        .unwrap_or(first)
+        .split_whitespace()
+        .next()?;
+    Some(v.trim_start_matches('v').to_string())
+}
+
+/// 사용할 JS 런타임 (yt-dlp 이름, 경로). 우선순위: 관리형 Deno → 시스템 Deno → Node → Bun
+pub fn resolve_js() -> Option<(&'static str, PathBuf)> {
+    let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+    let find = |name: &str, user_dir: &str| {
+        which(name).or_else(|| {
+            let p = home.as_ref()?.join(user_dir).join("bin").join(exe(name));
+            p.is_file().then_some(p)
+        })
+    };
+    let managed = deno_managed_path();
+    if managed.is_file() {
+        return Some(("deno", managed));
+    }
+    if let Some(p) = find("deno", ".deno") {
+        return Some(("deno", p));
+    }
+    if let Some(p) = which("node") {
+        return Some(("node", p));
+    }
+    find("bun", ".bun").map(|p| ("bun", p))
+}
+
+/// yt-dlp 에 JS 런타임 위치를 알려 주는 인자
+pub fn js_args() -> Vec<String> {
+    match resolve_js() {
+        Some((kind, p)) => vec!["--js-runtimes".into(), format!("{kind}:{}", p.display())],
+        None => Vec::new(),
+    }
+}
+
+pub fn deno_latest() -> Result<String> {
+    latest_tag(DENO_REPO)
+}
+
+/// 관리형 Deno 를 내려받는다. (압축 약 45MB, 풀면 약 110MB)
+pub fn install_deno(progress: &mut dyn FnMut(u64, u64)) -> Result<(String, String)> {
+    let asset = deno_asset().ok_or_else(|| anyhow!(t(Key::ErrNoDenoBuild)))?;
+    let tag = latest_tag(DENO_REPO)?;
+    let url = format!("https://github.com/{DENO_REPO}/releases/download/{tag}/{asset}");
+    let zip_path = managed_dir().join("deno.zip");
+    download_to(&url, &zip_path, false, progress)?;
+
+    let dest = deno_managed_path();
+    let result = (|| -> Result<()> {
+        let file = std::fs::File::open(&zip_path)?;
+        let mut archive = zip::ZipArchive::new(file).context(t(Key::ErrUnzip))?;
+        let mut entry = archive.by_name(&exe("deno")).context(t(Key::ErrUnzip))?;
+        let tmp = dest.with_extension("part");
+        {
+            let mut out =
+                std::io::BufWriter::new(std::fs::File::create(&tmp).context(t(Key::ErrTempFile))?);
+            std::io::copy(&mut entry, &mut out).context(t(Key::ErrUnzip))?;
+        }
+        if dest.exists() {
+            let old = dest.with_extension("old");
+            let _ = std::fs::remove_file(&old);
+            if std::fs::rename(&dest, &old).is_err() {
+                let _ = std::fs::remove_file(&dest);
+            }
+        }
+        std::fs::rename(&tmp, &dest).context(t(Key::ErrReplaceBinary))?;
+        make_executable(&dest);
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&zip_path);
+    result?;
+
+    let ver = js_version(&dest).ok_or_else(|| anyhow!(t(Key::ErrInstalledButFailed)))?;
+    set_installed_tag("deno", &tag);
+    Ok((ver, tag))
+}
+
+// ─────────────────────────────────────────────────────────────
 // UI 가 공유하는 상태
 // ─────────────────────────────────────────────────────────────
 
@@ -465,6 +594,10 @@ impl ToolState {
 pub struct Tools {
     pub ytdlp: ToolState,
     pub ffmpeg: ToolState,
+    /// JS 런타임 (관리형이면 Deno, 아니면 시스템의 deno/node/bun)
+    pub js: ToolState,
+    /// 쓰고 있는 JS 런타임 이름 ("deno" / "node" / "bun")
+    pub js_kind: Option<&'static str>,
 }
 
 pub type SharedTools = Arc<Mutex<Tools>>;
@@ -477,6 +610,24 @@ fn set_ytdlp<F: FnOnce(&mut ToolState)>(t: &SharedTools, ctx: &egui::Context, f:
 fn set_ffmpeg<F: FnOnce(&mut ToolState)>(t: &SharedTools, ctx: &egui::Context, f: F) {
     f(&mut t.lock().unwrap().ffmpeg);
     ctx.request_repaint();
+}
+
+fn set_js<F: FnOnce(&mut ToolState)>(t: &SharedTools, ctx: &egui::Context, f: F) {
+    f(&mut t.lock().unwrap().js);
+    ctx.request_repaint();
+}
+
+/// JS 런타임의 현재 설치 상태를 반영한다.
+fn probe_js(t: &mut Tools) {
+    let js = resolve_js();
+    t.js_kind = js.as_ref().map(|(k, _)| *k);
+    t.js.managed = js
+        .as_ref()
+        .map(|(_, p)| *p == deno_managed_path())
+        .unwrap_or(true);
+    t.js.local = js.as_ref().and_then(|(_, p)| js_version(p));
+    t.js.installed = installed_tag("deno");
+    t.js.path = js.map(|(_, p)| p);
 }
 
 /// 현재 설치 상태만 빠르게 읽어 온다. (네트워크 접근 없음)
@@ -495,6 +646,7 @@ pub fn probe_local(tools: &SharedTools, settings: &Settings) {
     t.ffmpeg.local = ff.as_deref().and_then(ffmpeg_version);
     t.ffmpeg.installed = installed_tag("ffmpeg");
     t.ffmpeg.path = ff;
+    probe_js(&mut t);
 }
 
 /// 시작 시 실행되는 점검 루틴.
@@ -609,7 +761,88 @@ pub fn spawn_startup_check(
         } else {
             set_ffmpeg(&tools, &ctx, |s| s.message.clear());
         }
+
+        // ── JS 런타임 (Deno) ────────────────────────
+        let js_managed = {
+            let mut t = tools.lock().unwrap();
+            probe_js(&mut t);
+            t.js.managed
+        };
+        ctx.request_repaint();
+        if resolve_js().is_none() {
+            if settings.auto_install_deno {
+                do_install_deno(&tools, &ctx);
+            } else {
+                set_js(&tools, &ctx, |s| {
+                    s.message = t(Key::MsgJsMissingWarn).into()
+                });
+            }
+        } else if js_managed && (settings.auto_update_check || force) {
+            set_js(&tools, &ctx, |s| {
+                s.busy = true;
+                s.message = t(Key::MsgCheckingLatest).into();
+            });
+            match deno_latest() {
+                Ok(v) => {
+                    let outdated = {
+                        let mut t = tools.lock().unwrap();
+                        t.js.latest = Some(v.clone());
+                        t.js.busy = false;
+                        t.js.update_available()
+                    };
+                    ctx.request_repaint();
+                    if outdated && settings.auto_update_tools {
+                        do_install_deno(&tools, &ctx);
+                    } else {
+                        set_js(&tools, &ctx, |s| {
+                            s.message = if outdated {
+                                tf(Key::MsgNewVersion, &[&pretty_tag(&v)])
+                            } else {
+                                t(Key::MsgUpToDate).into()
+                            };
+                        });
+                    }
+                }
+                Err(e) => set_js(&tools, &ctx, |s| {
+                    s.busy = false;
+                    s.message = tf(Key::MsgCheckFailed, &[&e.to_string()]);
+                }),
+            }
+        } else {
+            set_js(&tools, &ctx, |s| s.message.clear());
+        }
     });
+}
+
+fn do_install_deno(tools: &SharedTools, ctx: &egui::Context) {
+    set_js(tools, ctx, |s| {
+        s.busy = true;
+        s.message = t(Key::MsgDownloadingDeno).into();
+        s.progress = Some((0, 0, "deno".into()));
+    });
+    let t = tools.clone();
+    let c = ctx.clone();
+    let result = install_deno(&mut |got, total| {
+        t.lock().unwrap().js.progress = Some((got, total, "deno".into()));
+        c.request_repaint();
+    });
+    let mut g = tools.lock().unwrap();
+    g.js.busy = false;
+    g.js.progress = None;
+    match result {
+        Ok((ver, tag)) => {
+            probe_js(&mut g);
+            g.js.message = tf(Key::MsgApplied, &["deno", &ver]);
+            g.js.latest = Some(tag);
+        }
+        Err(e) => g.js.message = tf(Key::MsgInstallFailed, &[&e.to_string()]),
+    }
+    drop(g);
+    ctx.request_repaint();
+}
+
+pub fn spawn_install_deno(tools: SharedTools, ctx: egui::Context) {
+    std::thread::spawn(move || do_install_deno(&tools, &ctx));
 }
 
 fn do_install_ytdlp(tools: &SharedTools, ctx: &egui::Context) {

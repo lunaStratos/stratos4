@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 
 use crate::config::{PlaylistMode, Settings};
 use crate::i18n::{t, tf, Key};
@@ -84,6 +84,10 @@ pub struct Job {
     pub parent: Option<u64>,
     /// 이 작업이 플레이리스트 전체를 하나로 처리하는지
     pub playlist_single: bool,
+    /// 해석 작업이 목록을 바로 펼치지 않고 사용자 선택을 기다리는지 ('골라서 받기')
+    pub pick_mode: bool,
+    /// '골라서 받기' 로 읽어 온 목록. 선택을 기다리는 동안에만 Some
+    pub pick: Option<PickList>,
     /// UI: 로그 펼침 여부
     pub show_log: bool,
 
@@ -113,6 +117,8 @@ impl Job {
             finished_at: None,
             parent: None,
             playlist_single: false,
+            pick_mode: false,
+            pick: None,
             show_log: false,
             child: Arc::new(Mutex::new(None)),
             abort: Arc::new(AtomicU8::new(ABORT_NONE)),
@@ -125,6 +131,104 @@ impl Job {
         }
         self.log.push_back(line.into());
     }
+}
+
+/// 목록 해석으로 얻은 항목 하나
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub url: String,
+    pub title: String,
+    /// 초 단위 길이 (사이트가 flat 목록에 알려 줄 때만)
+    pub duration: Option<i64>,
+    /// 업로드 날짜 (사이트가 flat 목록에 알려 줄 때만)
+    pub date: Option<NaiveDate>,
+    /// YouTube 처럼 "3주 전" 을 날짜로 바꾼 대략값인지
+    pub date_approx: bool,
+}
+
+/// 사용자가 받을 항목을 고르는 중인 목록
+pub struct PickList {
+    pub list_title: String,
+    pub entries: Vec<Entry>,
+    pub checked: Vec<bool>,
+    /// UI: 제목 필터
+    pub filter: String,
+    /// UI: Shift+클릭 범위 선택의 기준 위치
+    pub anchor: Option<usize>,
+    /// 아직 선택 창을 한 번도 띄우지 않았는지
+    pub unseen: bool,
+    /// UI: 날짜로 고르기 입력값 (YYYY-MM-DD)
+    pub date_input: String,
+    /// UI: true = 그 날짜 이후(당일 포함), false = 그 날짜 이전
+    pub date_after: bool,
+    /// UI: 날짜로 고른 결과 안내
+    pub date_msg: String,
+}
+
+impl PickList {
+    pub fn new(list_title: String, entries: Vec<Entry>) -> Self {
+        let month_ago = Local::now()
+            .date_naive()
+            .checked_sub_months(chrono::Months::new(1))
+            .unwrap_or_default();
+        Self {
+            list_title,
+            checked: vec![true; entries.len()],
+            entries,
+            filter: String::new(),
+            anchor: None,
+            unseen: true,
+            date_input: month_ago.format("%Y-%m-%d").to_string(),
+            date_after: true,
+            date_msg: String::new(),
+        }
+    }
+
+    /// 제목 필터에 걸리는 항목 번호들
+    pub fn visible(&self) -> Vec<usize> {
+        let needle = self.filter.trim().to_lowercase();
+        (0..self.entries.len())
+            .filter(|&i| {
+                needle.is_empty() || self.entries[i].title.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub fn has_dates(&self) -> bool {
+        self.entries.iter().any(|e| e.date.is_some())
+    }
+
+    /// `among` 가운데 업로드 날짜가 조건(`after` 면 그날 이후, 아니면 그 전)에 맞는
+    /// 항목을 `check` 값으로 바꾼다. 날짜를 모르는 항목은 건드리지 않는다.
+    /// 반환값: (조건에 맞은 수, 날짜를 몰라 건너뛴 수)
+    pub fn apply_date(
+        &mut self,
+        among: &[usize],
+        date: NaiveDate,
+        after: bool,
+        check: bool,
+    ) -> (usize, usize) {
+        let (mut hit, mut unknown) = (0, 0);
+        for &i in among {
+            match self.entries[i].date {
+                Some(d) if (d >= date) == after => {
+                    self.checked[i] = check;
+                    hit += 1;
+                }
+                Some(_) => {}
+                None => unknown += 1,
+            }
+        }
+        (hit, unknown)
+    }
+}
+
+/// 날짜 입력을 읽는다. 2025-03-14 · 2025.03.14 · 2025/03/14 · 20250314
+pub fn parse_date(s: &str) -> Option<NaiveDate> {
+    let s = s.trim();
+    ["%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"]
+        .iter()
+        .find_map(|f| NaiveDate::parse_from_str(s, f).ok())
 }
 
 pub struct Engine {
@@ -174,10 +278,12 @@ impl Engine {
         let pl_mode = mode_override.unwrap_or(st.playlist_mode);
         let is_playlist = util::looks_like_playlist(url);
 
-        let mut job = if is_playlist && pl_mode == PlaylistMode::Expand {
+        let mut job = if is_playlist && matches!(pl_mode, PlaylistMode::Expand | PlaylistMode::Pick)
+        {
             let mut j = Job::new(self.new_id(), url.to_string(), JobKind::Resolve);
             j.title = t(Key::JobResolving).into();
             j.stage = t(Key::StageReadingList).into();
+            j.pick_mode = pl_mode == PlaylistMode::Pick;
             j
         } else {
             let mut j = Job::new(self.new_id(), url.to_string(), JobKind::Download);
@@ -198,6 +304,43 @@ impl Engine {
 
     pub fn add_many(&self, urls: &[String], mode_override: Option<PlaylistMode>) -> usize {
         urls.iter().map(|u| self.add_url(u, mode_override)).sum()
+    }
+
+    /// '골라서 받기' 목록에서 체크된 항목을 대기열에 넣는다. 반환값: 추가된 작업 수
+    pub fn add_picked(&self, id: u64) -> usize {
+        let st = self.settings.lock().unwrap().clone();
+        let mut g = self.jobs.lock().unwrap();
+        let Some(pick) = g
+            .iter_mut()
+            .find(|j| j.id == id)
+            .and_then(|j| j.pick.take())
+        else {
+            return 0;
+        };
+        let total = pick.entries.len();
+        let chosen: Vec<(usize, Entry)> = pick
+            .entries
+            .into_iter()
+            .zip(pick.checked)
+            .enumerate()
+            .filter(|(_, (_, c))| *c)
+            .map(|(i, (e, _))| (i, e))
+            .collect();
+        let added = insert_entries(
+            &mut g,
+            id,
+            &pick.list_title,
+            chosen,
+            total,
+            &st,
+            &self.next_id,
+        );
+        if let Some(p) = g.iter_mut().find(|x| x.id == id) {
+            p.stage = tf(Key::StageAddedItems, &[&added.to_string()]);
+        }
+        drop(g);
+        self.ctx.request_repaint();
+        added
     }
 
     // ── 제어 ─────────────────────────────────────────
@@ -241,6 +384,11 @@ impl Engine {
                     };
                     j.finished_at = Some(Local::now());
                 }
+                Status::Paused if code == ABORT_CANCEL => {
+                    j.status = Status::Canceled;
+                    j.stage.clear();
+                    j.finished_at = Some(Local::now());
+                }
                 _ => {}
             }
         }
@@ -282,9 +430,25 @@ impl Engine {
         }
     }
 
+    /// 실행 중·대기 중·일시정지된 작업을 모두 취소한다.
+    pub fn cancel_all(&self) {
+        let ids: Vec<u64> = self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| j.status.is_active() || j.status == Status::Paused)
+            .map(|j| j.id)
+            .collect();
+        for id in ids {
+            self.cancel(id);
+        }
+    }
+
     pub fn clear_finished(&self) {
         let mut jobs = self.jobs.lock().unwrap();
-        jobs.retain(|j| !j.status.is_finished());
+        // 아직 항목을 고르지 않은 목록은 남겨 둔다.
+        jobs.retain(|j| !j.status.is_finished() || j.pick.is_some());
         self.ctx.request_repaint();
     }
 
@@ -346,6 +510,7 @@ impl Engine {
                         url: j.url.clone(),
                         kind: j.kind,
                         playlist_single: j.playlist_single,
+                        pick: j.pick_mode,
                         child: j.child.clone(),
                         abort: j.abort.clone(),
                     });
@@ -380,6 +545,7 @@ struct Launch {
     url: String,
     kind: JobKind,
     playlist_single: bool,
+    pick: bool,
     child: Arc<Mutex<Option<Child>>>,
     abort: Arc<AtomicU8>,
 }
@@ -444,6 +610,9 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
     };
 
     let mut args = st.build_args(have_ffmpeg, ffmpeg.as_deref().and_then(|p| p.parent()));
+    let js = tools::js_args();
+    let have_js = !js.is_empty();
+    args.extend(js);
     args.extend(st.playlist_args(playlist_single));
     args.push(url.clone());
 
@@ -452,6 +621,9 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
         j.speed = 0.0;
         if !have_ffmpeg {
             j.push_log(t(Key::LogNoFfmpeg));
+        }
+        if !have_js {
+            j.push_log(t(Key::MsgJsMissingWarn));
         }
         j.push_log(format!("$ {} {}", bin.display(), args.join(" ")));
     });
@@ -543,6 +715,7 @@ fn run_download(launch: Launch, jobs: Jobs, settings: Arc<Mutex<Settings>>, ctx:
                         .unwrap_or_else(|| t(Key::ErrUnknownExit).into()),
                 );
             }
+            add_login_hint(j, &st);
         }
     });
     ctx.request_repaint();
@@ -559,6 +732,7 @@ fn run_resolve(
     let Launch {
         id,
         url,
+        pick,
         child: child_slot,
         abort,
         ..
@@ -580,6 +754,9 @@ fn run_resolve(
             "--no-warnings",
             "--no-colors",
             "--yes-playlist",
+            // YouTube 목록은 "3주 전" 만 알려 주므로 이를 대략적인 날짜로 바꿔 받는다.
+            "--extractor-args",
+            "youtubetab:approximate_date",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -595,10 +772,7 @@ fn run_resolve(
         args.push("--proxy".into());
         args.push(st.proxy.trim().into());
     }
-    if !st.cookies_from_browser.trim().is_empty() {
-        args.push("--cookies-from-browser".into());
-        args.push(st.cookies_from_browser.trim().into());
-    }
+    args.extend(st.auth_args());
     args.extend(crate::util::shell_split(&st.extra_args));
     args.push(url.clone());
 
@@ -669,6 +843,7 @@ fn run_resolve(
             if j.error.is_none() {
                 j.error = Some(t(Key::ErrPlaylistReadFailed).into());
             }
+            add_login_hint(j, &st);
         });
         ctx.request_repaint();
         return;
@@ -680,14 +855,8 @@ fn run_resolve(
         .unwrap_or(t(Key::TitlePlaylist))
         .to_string();
 
-    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
     collect_entries(&root, &mut entries);
-
-    let limit = st.playlist_expand_limit as usize;
-    let truncated = limit > 0 && entries.len() > limit;
-    if truncated {
-        entries.truncate(limit);
-    }
 
     if entries.is_empty() {
         // 플레이리스트가 아니었던 경우 → 단일 영상으로 처리
@@ -714,68 +883,162 @@ fn run_resolve(
         return;
     }
 
-    let total = entries.len();
-    {
-        let mut g = jobs.lock().unwrap();
-        let insert_at = g
-            .iter()
-            .position(|x| x.id == id)
-            .map(|p| p + 1)
-            .unwrap_or(g.len());
-        let existing: Vec<String> = if st.skip_duplicates {
-            g.iter().map(|j| j.url.clone()).collect()
-        } else {
-            Vec::new()
-        };
+    let mut g = jobs.lock().unwrap();
 
-        let mut new_jobs = Vec::with_capacity(total);
-        for (idx, (entry_url, title)) in entries.into_iter().enumerate() {
-            if st.skip_duplicates && existing.contains(&entry_url) {
-                continue;
-            }
-            let mut j = Job::new(
-                next_id.fetch_add(1, Ordering::SeqCst),
-                entry_url,
-                JobKind::Download,
-            );
-            j.title = if title.is_empty() {
-                format!("{} - {}", list_title, idx + 1)
-            } else {
-                title
-            };
-            j.parent = Some(id);
-            j.item = Some((idx as u32 + 1, total as u32));
-            if !st.auto_start {
-                j.status = Status::Paused;
-            }
-            new_jobs.push(j);
-        }
-        let added = new_jobs.len();
-        for (k, j) in new_jobs.into_iter().enumerate() {
-            let at = (insert_at + k).min(g.len());
-            g.insert(at, j);
-        }
+    // 골라서 받기: 목록만 보관하고 사용자가 선택 창에서 고를 때까지 기다린다.
+    // 사용자가 직접 고르므로 펼치기 상한은 적용하지 않는다.
+    if pick {
+        let n = entries.len();
         if let Some(p) = g.iter_mut().find(|x| x.id == id) {
             p.status = Status::Done;
             p.progress = 1.0;
-            p.title = list_title;
-            p.stage = if truncated {
-                tf(
-                    Key::StageAddedTruncated,
-                    &[&added.to_string(), &limit.to_string()],
-                )
-            } else {
-                tf(Key::StageAddedItems, &[&added.to_string()])
-            };
+            p.title = list_title.clone();
+            p.stage = tf(Key::StagePickWaiting, &[&n.to_string()]);
             p.finished_at = Some(Local::now());
+            p.pick = Some(PickList::new(list_title, entries));
         }
+        drop(g);
+        ctx.request_repaint();
+        return;
     }
+
+    let limit = st.playlist_expand_limit as usize;
+    let truncated = limit > 0 && entries.len() > limit;
+    if truncated {
+        entries.truncate(limit);
+    }
+    let total = entries.len();
+    let added = insert_entries(
+        &mut g,
+        id,
+        &list_title,
+        entries.into_iter().enumerate().collect(),
+        total,
+        &st,
+        &next_id,
+    );
+    if let Some(p) = g.iter_mut().find(|x| x.id == id) {
+        p.status = Status::Done;
+        p.progress = 1.0;
+        p.title = list_title;
+        p.stage = if truncated {
+            tf(
+                Key::StageAddedTruncated,
+                &[&added.to_string(), &limit.to_string()],
+            )
+        } else {
+            tf(Key::StageAddedItems, &[&added.to_string()])
+        };
+        p.finished_at = Some(Local::now());
+    }
+    drop(g);
     ctx.request_repaint();
 }
 
-/// flat-playlist JSON 에서 (url, title) 목록을 재귀적으로 모은다.
+/// 오류가 로그인 부족 때문으로 보이면 설정 방법을 덧붙인다.
+/// YouTube 의 JS challenge 를 못 풀어 형식이 빠진 경우도 여기서 안내한다.
+fn add_login_hint(j: &mut Job, st: &Settings) {
+    let Some(err) = j.error.as_ref() else { return };
+    if j.log.iter().any(|l| l.contains("challenge solving failed")) {
+        let hint = if tools::resolve_js().is_some() {
+            t(Key::ErrJsChallengeFailed)
+        } else {
+            t(Key::ErrJsRuntimeMissing)
+        };
+        j.error = Some(format!("{err}\n→ {hint}"));
+        return;
+    }
+    if !needs_login(err) && !j.log.iter().any(|l| needs_login(l)) {
+        return;
+    }
+    let hint = if st.has_auth() {
+        t(Key::ErrLoginCookiesRejected)
+    } else {
+        t(Key::ErrLoginRequired)
+    };
+    j.error = Some(format!("{err}\n→ {hint}"));
+}
+
+/// yt-dlp 가 로그인이 필요할 때 내는 대표적인 오류 문구
+pub(crate) fn needs_login(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.starts_with("error")
+        && [
+            "sign in",
+            "login required",
+            "log in",
+            "private video",
+            "private playlist",
+            "playlist does not exist",
+            "members-only",
+            "join this channel",
+            "use --cookies",
+            "--cookies-from-browser",
+            "account cookies",
+        ]
+        .iter()
+        .any(|m| l.contains(m))
+}
+
+/// 목록 항목들을 부모(해석) 작업 바로 뒤에 개별 다운로드 작업으로 끼워 넣는다.
+/// `entries` 의 번호는 원래 목록에서의 위치(0부터)이고 `total` 은 원래 목록 크기다.
+/// 반환값: 실제로 추가된 작업 수 (중복 건너뛰기 반영)
+fn insert_entries(
+    g: &mut Vec<Job>,
+    parent: u64,
+    list_title: &str,
+    entries: Vec<(usize, Entry)>,
+    total: usize,
+    st: &Settings,
+    next_id: &AtomicU64,
+) -> usize {
+    let insert_at = g
+        .iter()
+        .position(|x| x.id == parent)
+        .map(|p| p + 1)
+        .unwrap_or(g.len());
+    let existing: Vec<String> = if st.skip_duplicates {
+        g.iter()
+            .filter(|j| !matches!(j.status, Status::Failed | Status::Canceled))
+            .map(|j| j.url.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut new_jobs = Vec::with_capacity(entries.len());
+    for (idx, e) in entries {
+        if st.skip_duplicates && existing.contains(&e.url) {
+            continue;
+        }
+        let mut j = Job::new(
+            next_id.fetch_add(1, Ordering::SeqCst),
+            e.url,
+            JobKind::Download,
+        );
+        j.title = if e.title.is_empty() {
+            format!("{} - {}", list_title, idx + 1)
+        } else {
+            e.title
+        };
+        j.parent = Some(parent);
+        j.item = Some((idx as u32 + 1, total as u32));
+        if !st.auto_start {
+            j.status = Status::Paused;
+        }
+        new_jobs.push(j);
+    }
+    let added = new_jobs.len();
+    for (k, j) in new_jobs.into_iter().enumerate() {
+        let at = (insert_at + k).min(g.len());
+        g.insert(at, j);
+    }
+    added
+}
+
+/// flat-playlist JSON 에서 항목 목록을 재귀적으로 모은다.
 /// 채널 URL 처럼 플레이리스트가 중첩된 경우도 처리한다.
-fn collect_entries(node: &serde_json::Value, out: &mut Vec<(String, String)>) {
+fn collect_entries(node: &serde_json::Value, out: &mut Vec<Entry>) {
     let Some(entries) = node.get("entries").and_then(|v| v.as_array()) else {
         return;
     };
@@ -812,12 +1075,53 @@ fn collect_entries(node: &serde_json::Value, out: &mut Vec<(String, String)>) {
                     None
                 }
             });
+        let duration = e
+            .get("duration")
+            .and_then(|v| v.as_f64())
+            .filter(|d| *d > 0.0)
+            .map(|d| d.round() as i64);
+        let (date, date_approx) = entry_date(e);
         if let Some(u) = url {
             if u.starts_with("http") {
-                out.push((u, title));
+                out.push(Entry {
+                    url: u,
+                    title,
+                    duration,
+                    date,
+                    date_approx,
+                });
             }
         }
     }
+}
+
+/// 항목의 업로드 날짜. `upload_date`(YYYYMMDD) 가 있으면 정확한 값이고,
+/// `timestamp` 만 있으면 YouTube 의 "N주 전" 을 바꾼 대략값일 수 있다.
+fn entry_date(e: &serde_json::Value) -> (Option<NaiveDate>, bool) {
+    if let Some(d) = e
+        .get("upload_date")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y%m%d").ok())
+    {
+        return (Some(d), false);
+    }
+    let ts = ["timestamp", "release_timestamp"]
+        .iter()
+        .find_map(|k| e.get(*k).and_then(|v| v.as_i64()));
+    let Some(date) = ts
+        .and_then(|t| DateTime::from_timestamp(t, 0))
+        .map(|d| d.with_timezone(&Local).date_naive())
+    else {
+        return (None, false);
+    };
+    let youtube = e
+        .get("ie_key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k.to_ascii_lowercase().contains("youtube"))
+        || e.get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|u| u.contains("youtube.com") || u.contains("youtu.be"));
+    (Some(date), youtube)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -961,4 +1265,119 @@ fn handle_line(jobs: &Jobs, id: u64, playlist_single: bool, line: &str) {
         return;
     }
     with_job(jobs, id, |j| j.push_log(trimmed.to_string()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collects_nested_entries_with_duration() {
+        let root = serde_json::json!({
+            "title": "channel",
+            "entries": [
+                { "title": "Videos", "entries": [
+                    { "id": "abc", "ie_key": "Youtube", "title": "A", "duration": 61.4,
+                      "timestamp": 1_700_000_000 },
+                    { "url": "https://example.com/b", "title": "B", "upload_date": "20240131" },
+                ]},
+                { "url": "not-a-url", "title": "skip" },
+            ]
+        });
+        let mut out = Vec::new();
+        collect_entries(&root, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Entry {
+                    url: "https://www.youtube.com/watch?v=abc".into(),
+                    title: "A".into(),
+                    duration: Some(61),
+                    date: DateTime::from_timestamp(1_700_000_000, 0)
+                        .map(|d| d.with_timezone(&Local).date_naive()),
+                    date_approx: true,
+                },
+                Entry {
+                    url: "https://example.com/b".into(),
+                    title: "B".into(),
+                    duration: None,
+                    date: NaiveDate::from_ymd_opt(2024, 1, 31),
+                    date_approx: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn picks_by_upload_date() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day);
+        let mk = |title: &str, date| Entry {
+            url: format!("https://example.com/{title}"),
+            title: title.into(),
+            duration: None,
+            date,
+            date_approx: false,
+        };
+        let mut p = PickList::new(
+            "list".into(),
+            vec![
+                mk("old", d(2024, 1, 1)),
+                mk("edge", d(2024, 6, 1)),
+                mk("new", d(2025, 1, 1)),
+                mk("nodate", None),
+            ],
+        );
+        let all = p.visible();
+        let cut = d(2024, 6, 1).unwrap();
+
+        // 이후(당일 포함) 빼기 → old 와 날짜 없는 항목만 남는다.
+        assert_eq!(p.apply_date(&all, cut, true, false), (2, 1));
+        assert_eq!(p.checked, [true, false, false, true]);
+
+        // 이전 빼기 → old 도 빠진다.
+        assert_eq!(p.apply_date(&all, cut, false, false), (1, 1));
+        assert_eq!(p.checked, [false, false, false, true]);
+
+        // 이후 체크 → edge, new 가 다시 들어간다.
+        assert_eq!(p.apply_date(&all, cut, true, true), (2, 1));
+        assert_eq!(p.checked, [false, true, true, true]);
+
+        // 제목 필터에 걸린 항목에만 적용된다.
+        p.filter = "new".into();
+        let vis = p.visible();
+        assert_eq!(p.apply_date(&vis, cut, true, false), (1, 0));
+        assert_eq!(p.checked, [false, true, false, true]);
+    }
+
+    #[test]
+    fn parses_date_inputs() {
+        let want = NaiveDate::from_ymd_opt(2025, 3, 14);
+        for s in ["2025-03-14", " 2025.03.14 ", "2025/03/14", "20250314"] {
+            assert_eq!(parse_date(s), want, "{s}");
+        }
+        assert_eq!(parse_date("2025-13-01"), None);
+        assert_eq!(parse_date(""), None);
+    }
+
+    #[test]
+    fn detects_login_errors() {
+        assert!(needs_login(
+            "ERROR: [youtube:tab] PLxx: The playlist does not exist."
+        ));
+        assert!(needs_login(
+            "ERROR: [youtube] abc: Private video. Sign in if you've been granted access"
+        ));
+        assert!(!needs_login("ERROR: [youtube] abc: Video unavailable"));
+        assert!(!needs_login("[info] Sign in to confirm"));
+    }
+
+    #[test]
+    fn cookies_file_takes_priority() {
+        let mut st = Settings::default();
+        assert!(st.auth_args().is_empty());
+        st.cookies_from_browser = "firefox".into();
+        assert_eq!(st.auth_args(), ["--cookies-from-browser", "firefox"]);
+        st.cookies_file = " /tmp/c.txt ".into();
+        assert_eq!(st.auth_args(), ["--cookies", "/tmp/c.txt"]);
+    }
 }

@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText};
 
 use crate::config::{BinMode, Mode, PlaylistMode, Settings, ThemePref};
-use crate::engine::{Engine, Job, JobKind, Status};
+use crate::engine::{parse_date, Engine, Job, JobKind, Status};
 use crate::i18n::{self, t, tf, Key, Lang};
+use crate::login::{self, Browser, Phase, SharedLogin};
 use crate::tools::{self, SharedTools, ToolState, Tools};
 use crate::util::{fmt_bytes, fmt_eta, fmt_speed};
 
@@ -19,6 +20,7 @@ enum Act {
     OpenFile(std::path::PathBuf),
     Reveal(std::path::PathBuf),
     CopyUrl(String),
+    OpenPick(u64),
 }
 
 pub struct App {
@@ -28,6 +30,8 @@ pub struct App {
     /// 추가 시 플레이리스트 처리 방식 (None = 설정값 사용)
     add_mode: Option<PlaylistMode>,
     show_settings: bool,
+    /// 항목 선택 창을 띄운 해석 작업 id
+    pick_open: Option<u64>,
     /// 붙여넣기로 추가한 뒤 입력창을 비우기 위한 플래그
     clear_input_after_frame: bool,
     toast: Option<(String, Instant)>,
@@ -37,6 +41,12 @@ pub struct App {
     last_clip_poll: Instant,
 
     tools: SharedTools,
+
+    login: SharedLogin,
+    /// 설치된 로그인용 브라우저 (추천 순)
+    browsers: Vec<(Browser, std::path::PathBuf)>,
+    /// 설정 창에서 고른 로그인 브라우저
+    login_pick: Option<Browser>,
 }
 
 impl App {
@@ -67,7 +77,7 @@ impl App {
         let due = now - settings.last_update_check > 86_400;
         let missing = {
             let t = tools.lock().unwrap();
-            t.ytdlp.local.is_none() || t.ffmpeg.local.is_none()
+            t.ytdlp.local.is_none() || t.ffmpeg.local.is_none() || t.js.local.is_none()
         };
         if missing || (settings.auto_update_check && due) {
             settings.last_update_check = now;
@@ -76,18 +86,27 @@ impl App {
             tools::spawn_startup_check(tools.clone(), settings.clone(), cc.egui_ctx.clone(), false);
         }
 
+        let browsers = login::installed();
+        let login_pick = Browser::from_id(&settings.login_browser)
+            .filter(|b| browsers.iter().any(|(x, _)| x == b))
+            .or_else(|| browsers.first().map(|(b, _)| *b));
+
         Self {
             engine,
             settings: settings_arc,
             input: String::new(),
             add_mode: None,
             show_settings: false,
+            pick_open: None,
             clear_input_after_frame: false,
             toast: None,
             clipboard,
             last_clip,
             last_clip_poll: Instant::now(),
             tools,
+            login: Default::default(),
+            browsers,
+            login_pick,
         }
     }
 
@@ -286,6 +305,7 @@ impl eframe::App for App {
         if self.show_settings {
             self.settings_window(ctx);
         }
+        self.pick_window(ctx);
 
         if self.clear_input_after_frame {
             self.clear_input_after_frame = false;
@@ -319,6 +339,12 @@ impl App {
                         self.show_settings = !self.show_settings;
                     }
                     let t = self.tools.lock().unwrap().clone();
+                    if tool_chip(ui, t.js_kind.unwrap_or("deno"), &t.js)
+                        .on_hover_text(i18n::t(Key::TipJsRuntime))
+                        .clicked()
+                    {
+                        self.show_settings = true;
+                    }
                     if tool_chip(ui, "ffmpeg", &t.ffmpeg).clicked() {
                         self.show_settings = true;
                     }
@@ -335,6 +361,7 @@ impl App {
                     .progress
                     .clone()
                     .or_else(|| t.ffmpeg.progress.clone())
+                    .or_else(|| t.js.progress.clone())
             };
             if let Some((got, total, label)) = dl {
                 let frac = if total > 0 {
@@ -474,6 +501,7 @@ impl App {
                     .selected_text(playlist_mode_label(cur))
                     .show_ui(ui, |ui| {
                         for m in [
+                            PlaylistMode::Pick,
                             PlaylistMode::Expand,
                             PlaylistMode::Single,
                             PlaylistMode::VideoOnly,
@@ -533,6 +561,9 @@ impl App {
                     if ui.button(t(Key::BtnClearFinished)).clicked() {
                         self.engine.clear_finished();
                     }
+                    if ui.button(format!("⏹ {}", t(Key::BtnCancelAll))).clicked() {
+                        self.engine.cancel_all();
+                    }
                     if ui.button(format!("⏸ {}", t(Key::BtnPauseAll))).clicked() {
                         self.engine.pause_all();
                     }
@@ -558,6 +589,20 @@ impl App {
 
     fn job_list(&mut self, ctx: &egui::Context) {
         let mut acts: Vec<Act> = Vec::new();
+
+        // 방금 목록을 다 읽은 '골라서 받기' 작업이 있으면 선택 창을 한 번 자동으로 띄운다.
+        if self.pick_open.is_none() {
+            let mut jobs = self.engine.jobs.lock().unwrap();
+            if let Some(j) = jobs
+                .iter_mut()
+                .find(|j| j.pick.as_ref().is_some_and(|p| p.unseen))
+            {
+                if let Some(p) = j.pick.as_mut() {
+                    p.unseen = false;
+                }
+                self.pick_open = Some(j.id);
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut jobs = self.engine.jobs.lock().unwrap();
@@ -594,6 +639,7 @@ impl App {
                     }
                     self.toast(t(Key::ToastUrlCopied));
                 }
+                Act::OpenPick(id) => self.pick_open = Some(id),
             }
         }
     }
@@ -602,6 +648,7 @@ impl App {
 fn playlist_mode_label(m: PlaylistMode) -> &'static str {
     t(match m {
         PlaylistMode::Expand => Key::PlModeExpand,
+        PlaylistMode::Pick => Key::PlModePick,
         PlaylistMode::Single => Key::PlModeSingle,
         PlaylistMode::VideoOnly => Key::PlModeVideoOnly,
     })
@@ -610,6 +657,7 @@ fn playlist_mode_label(m: PlaylistMode) -> &'static str {
 fn playlist_mode_hint(m: PlaylistMode) -> &'static str {
     t(match m {
         PlaylistMode::Expand => Key::PlHintExpand,
+        PlaylistMode::Pick => Key::PlHintPick,
         PlaylistMode::Single => Key::PlHintSingle,
         PlaylistMode::VideoOnly => Key::PlHintVideoOnly,
     })
@@ -691,14 +739,25 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                     ui.label(RichText::new(&j.stage).small().weak());
                 }
                 if let Some(e) = &j.error {
+                    let first = e.lines().next().unwrap_or_default();
                     ui.label(
-                        RichText::new(truncate(e, 160))
+                        RichText::new(truncate(first, 160))
                             .small()
                             .color(Color32::from_rgb(220, 110, 110)),
                     )
                     .on_hover_text(e);
                 }
             });
+            // 오류 뒤에 붙은 안내(로그인 설정 방법 등)는 잘리지 않게 따로 보여 준다.
+            if let Some(e) = &j.error {
+                for extra in e.lines().skip(1) {
+                    ui.label(
+                        RichText::new(extra)
+                            .small()
+                            .color(Color32::from_rgb(220, 150, 60)),
+                    );
+                }
+            }
 
             // 버튼 줄
             ui.horizontal(|ui| {
@@ -748,6 +807,10 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
                     }
                 }
 
+                if j.pick.is_some() && ui.small_button(format!("☑ {}", t(Key::BtnPick))).clicked()
+                {
+                    acts.push(Act::OpenPick(j.id));
+                }
                 if ui
                     .small_button(format!("🔗 {}", t(Key::BtnCopyUrl)))
                     .clicked()
@@ -787,6 +850,294 @@ fn job_row(ui: &mut egui::Ui, j: &mut Job, acts: &mut Vec<Act>) {
         });
 }
 
+// ─────────────────────────────────────────────────────────────
+// 항목 선택 창 ('골라서 받기')
+// ─────────────────────────────────────────────────────────────
+
+impl App {
+    fn pick_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pick_open else { return };
+        let mut open = true;
+        let mut add = false;
+        let mut later = false;
+        {
+            let mut jobs = self.engine.jobs.lock().unwrap();
+            // 작업이 지워졌거나 이미 추가를 마쳤으면 창을 닫는다.
+            let Some(pick) = jobs
+                .iter_mut()
+                .find(|j| j.id == id)
+                .and_then(|j| j.pick.as_mut())
+            else {
+                self.pick_open = None;
+                return;
+            };
+
+            egui::Window::new(t(Key::BtnPick))
+                .id(egui::Id::new(("pick", id)))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(640.0)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.screen_rect().center())
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(&pick.list_title).strong());
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut pick.filter)
+                                .hint_text(t(Key::PickFilterHint))
+                                .desired_width(220.0),
+                        );
+                        if ui
+                            .small_button(t(Key::PickInvert))
+                            .on_hover_text(t(Key::PickScopeTip))
+                            .clicked()
+                        {
+                            for i in pick.visible() {
+                                pick.checked[i] ^= true;
+                            }
+                        }
+                    });
+
+                    // ── 업로드 날짜로 고르기 ──
+                    if pick.has_dates() {
+                        ui.add_space(2.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let approx = pick.entries.iter().any(|e| e.date_approx);
+                            let label = ui.label(t(Key::PickDateLabel));
+                            if approx {
+                                label.on_hover_text(t(Key::PickDateApproxTip));
+                            }
+                            let parsed = parse_date(&pick.date_input);
+                            let mut edit = egui::TextEdit::singleline(&mut pick.date_input)
+                                .hint_text("YYYY-MM-DD")
+                                .desired_width(92.0);
+                            if parsed.is_none() {
+                                edit = edit.text_color(Color32::from_rgb(220, 90, 90));
+                            }
+                            ui.add(edit);
+                            egui::ComboBox::from_id_salt(("pick_after", id))
+                                .width(70.0)
+                                .selected_text(if pick.date_after {
+                                    t(Key::PickDateAfter)
+                                } else {
+                                    t(Key::PickDateBefore)
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut pick.date_after,
+                                        true,
+                                        t(Key::PickDateAfter),
+                                    );
+                                    ui.selectable_value(
+                                        &mut pick.date_after,
+                                        false,
+                                        t(Key::PickDateBefore),
+                                    );
+                                });
+                            let mut op = None;
+                            if ui
+                                .add_enabled(
+                                    parsed.is_some(),
+                                    egui::Button::new(t(Key::PickDateCheck)).small(),
+                                )
+                                .on_hover_text(t(Key::PickScopeTip))
+                                .on_disabled_hover_text(t(Key::PickDateInvalid))
+                                .clicked()
+                            {
+                                op = Some(true);
+                            }
+                            if ui
+                                .add_enabled(
+                                    parsed.is_some(),
+                                    egui::Button::new(t(Key::PickDateUncheck)).small(),
+                                )
+                                .on_hover_text(t(Key::PickScopeTip))
+                                .on_disabled_hover_text(t(Key::PickDateInvalid))
+                                .clicked()
+                            {
+                                op = Some(false);
+                            }
+                            if let (Some(check), Some(date)) = (op, parsed) {
+                                let vis = pick.visible();
+                                let (hit, unknown) =
+                                    pick.apply_date(&vis, date, pick.date_after, check);
+                                pick.date_msg = if unknown > 0 {
+                                    tf(
+                                        Key::PickDateResultUnknown,
+                                        &[&hit.to_string(), &unknown.to_string()],
+                                    )
+                                } else {
+                                    tf(Key::PickDateResult, &[&hit.to_string()])
+                                };
+                            }
+
+                            ui.separator();
+                            // 빠른 날짜: 오늘로부터 N 전
+                            let today = chrono::Local::now().date_naive();
+                            for (key, months, days) in [
+                                (Key::PickAgoWeek, 0, 7),
+                                (Key::PickAgoMonth, 1, 0),
+                                (Key::PickAgo3Months, 3, 0),
+                                (Key::PickAgo6Months, 6, 0),
+                                (Key::PickAgoYear, 12, 0),
+                            ] {
+                                if ui.small_button(t(key)).clicked() {
+                                    let d = today
+                                        .checked_sub_months(chrono::Months::new(months))
+                                        .and_then(|d| {
+                                            d.checked_sub_signed(chrono::Duration::days(days))
+                                        })
+                                        .unwrap_or(today);
+                                    pick.date_input = d.format("%Y-%m-%d").to_string();
+                                }
+                            }
+                        });
+                        if !pick.date_msg.is_empty() {
+                            ui.label(RichText::new(&pick.date_msg).small().weak());
+                        }
+                    }
+                    ui.add_space(4.0);
+
+                    let visible = pick.visible();
+                    let width = pick.entries.len().to_string().len();
+                    let row_h = ui.spacing().interact_size.y;
+
+                    // ── 머리 줄: 보이는 항목 전체 체크/해제 ──
+                    let on = visible.iter().filter(|&&i| pick.checked[i]).count();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(" ".repeat(width)).monospace().small());
+                        let mut all = !visible.is_empty() && on == visible.len();
+                        if ui
+                            .add(
+                                egui::Checkbox::new(&mut all, t(Key::PickSelectAll))
+                                    .indeterminate(on > 0 && on < visible.len()),
+                            )
+                            .on_hover_text(t(Key::PickScopeTip))
+                            .changed()
+                        {
+                            for &i in &visible {
+                                pick.checked[i] = all;
+                            }
+                        }
+                    });
+                    ui.separator();
+
+                    // 채널은 수천 개일 수 있으므로 보이는 줄만 그린다.
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, row_h, visible.len(), |ui, rows| {
+                            for i in rows.map(|r| visible[r]) {
+                                let e = &pick.entries[i];
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:>width$}", i + 1))
+                                            .monospace()
+                                            .small()
+                                            .weak(),
+                                    );
+                                    let mut c = pick.checked[i];
+                                    let resp = ui
+                                        .checkbox(&mut c, truncate(&e.title, 64))
+                                        .on_hover_text(format!("{}\n{}", e.title, e.url));
+                                    if resp.changed() {
+                                        let shift = ui.input(|inp| inp.modifiers.shift);
+                                        // Shift+클릭: 직전에 누른 항목부터 여기까지를 같은 값으로 맞춘다.
+                                        let from = pick
+                                            .anchor
+                                            .filter(|_| shift)
+                                            .and_then(|a| visible.iter().position(|&v| v == a));
+                                        let here = visible.iter().position(|&v| v == i);
+                                        match (from, here) {
+                                            (Some(a), Some(b)) => {
+                                                for &v in &visible[a.min(b)..=a.max(b)] {
+                                                    pick.checked[v] = c;
+                                                }
+                                            }
+                                            _ => pick.checked[i] = c,
+                                        }
+                                        pick.anchor = Some(i);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if let Some(d) = e.duration {
+                                                ui.label(
+                                                    RichText::new(fmt_eta(d))
+                                                        .monospace()
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                            }
+                                            if let Some(d) = e.date {
+                                                let text = format!(
+                                                    "{}{}",
+                                                    if e.date_approx { "≈" } else { "" },
+                                                    d.format("%Y-%m-%d")
+                                                );
+                                                let l = ui.label(
+                                                    RichText::new(text).monospace().small().weak(),
+                                                );
+                                                if e.date_approx {
+                                                    l.on_hover_text(t(Key::PickDateApproxTip));
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+
+                    ui.separator();
+                    let selected = pick.checked.iter().filter(|c| **c).count();
+                    ui.horizontal(|ui| {
+                        ui.label(tf(
+                            Key::PickCount,
+                            &[&selected.to_string(), &pick.entries.len().to_string()],
+                        ));
+                        ui.label(RichText::new(t(Key::PickRangeTip)).small().weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    selected > 0,
+                                    egui::Button::new(tf(
+                                        Key::PickAddSelected,
+                                        &[&selected.to_string()],
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                add = true;
+                            }
+                            if ui
+                                .button(t(Key::PickLater))
+                                .on_hover_text(t(Key::PickLaterTip))
+                                .clicked()
+                            {
+                                later = true;
+                            }
+                        });
+                    });
+                });
+        }
+
+        if add {
+            let n = self.engine.add_picked(id);
+            if n == 0 {
+                self.toast(t(Key::ToastDuplicate));
+            } else {
+                self.toast(tf(Key::ToastAdded, &[&n.to_string()]));
+            }
+        }
+        if add || later || !open {
+            self.pick_open = None;
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -808,8 +1159,12 @@ impl App {
         let mut lang_changed: Option<Option<Lang>> = None;
         let mut do_install_yt = false;
         let mut do_install_ff = false;
+        let mut do_install_js = false;
         let mut do_check = false;
         let mut reprobe = false;
+        let mut do_login_open = false;
+        let mut do_login_check = false;
+        let mut do_logout = false;
 
         egui::Window::new(t(Key::BtnSettings))
             .open(&mut open)
@@ -1109,6 +1464,7 @@ impl App {
                                 .selected_text(playlist_mode_label(st.playlist_mode))
                                 .show_ui(ui, |ui| {
                                     for m in [
+                                        PlaylistMode::Pick,
                                         PlaylistMode::Expand,
                                         PlaylistMode::Single,
                                         PlaylistMode::VideoOnly,
@@ -1119,6 +1475,7 @@ impl App {
                                                 m,
                                                 playlist_mode_label(m),
                                             )
+                                            .on_hover_text(playlist_mode_hint(m))
                                             .changed();
                                     }
                                 });
@@ -1196,34 +1553,219 @@ impl App {
                                 )
                                 .changed();
                             ui.end_row();
+                        });
 
-                            ui.label(t(Key::LblBrowserCookies));
-                            egui::ComboBox::from_id_salt("cookies")
-                                .width(160.0)
-                                .selected_text(if st.cookies_from_browser.is_empty() {
-                                    t(Key::OptDisabled).to_string()
-                                } else {
-                                    st.cookies_from_browser.clone()
+                    // ── 로그인 (비공개·회원 전용 영상과 플레이리스트) ──
+                    ui.add_space(10.0);
+                    ui.heading(t(Key::HdrLogin));
+                    ui.label(RichText::new(t(Key::MsgLoginInfo)).small().weak());
+                    ui.add_space(4.0);
+
+                    let ls = self.login.lock().unwrap().clone();
+                    if self.browsers.is_empty() {
+                        ui.label(
+                            RichText::new(t(Key::LoginNoBrowser))
+                                .small()
+                                .color(Color32::from_rgb(220, 150, 60)),
+                        );
+                    } else {
+                        let idle = ls.phase == Phase::Idle;
+                        egui::Grid::new("g_applogin")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label(t(Key::LblLoginBrowser));
+                                let cur = self.login_pick;
+                                ui.add_enabled_ui(idle, |ui| {
+                                    egui::ComboBox::from_id_salt("login_browser")
+                                        .width(160.0)
+                                        .selected_text(cur.map(|b| b.name()).unwrap_or_default())
+                                        .show_ui(ui, |ui| {
+                                            for (b, _) in &self.browsers {
+                                                ui.selectable_value(
+                                                    &mut self.login_pick,
+                                                    Some(*b),
+                                                    b.name(),
+                                                );
+                                            }
+                                        });
                                 })
-                                .show_ui(ui, |ui| {
-                                    for b in [
-                                        "", "chrome", "edge", "firefox", "safari", "brave",
-                                        "whale", "opera",
-                                    ] {
-                                        let label =
-                                            if b.is_empty() { t(Key::OptDisabled) } else { b };
-                                        let mut cur = st.cookies_from_browser.clone();
-                                        if ui
-                                            .selectable_value(&mut cur, b.to_string(), label)
-                                            .changed()
+                                .response
+                                .on_hover_text(t(Key::TipLoginBrowser));
+                                if self.login_pick != cur {
+                                    self.login.lock().unwrap().signed_in = None;
+                                }
+                                ui.end_row();
+
+                                let pick = self.login_pick;
+                                let has = pick.is_some_and(login::has_profile);
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            idle && pick.is_some(),
+                                            egui::Button::new(format!(
+                                                "🔑 {}",
+                                                t(Key::BtnLoginOpen)
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(b) = pick {
+                                            st.login_browser = b.id().to_string();
+                                            dirty = true;
+                                            do_login_open = true;
+                                        }
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            idle && has,
+                                            egui::Button::new(t(Key::BtnLoginCheck)),
+                                        )
+                                        .clicked()
+                                    {
+                                        do_login_check = true;
+                                    }
+                                    let can_logout =
+                                        pick.is_some_and(|b| login::profile_dir(b).exists());
+                                    if ui
+                                        .add_enabled(
+                                            idle && can_logout,
+                                            egui::Button::new(t(Key::BtnLogout)),
+                                        )
+                                        .on_hover_text(t(Key::TipLogout))
+                                        .clicked()
+                                    {
+                                        if let Some(b) = pick {
+                                            if st.login_browser == b.id() {
+                                                st.login_browser.clear();
+                                                dirty = true;
+                                            }
+                                        }
+                                        do_logout = true;
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("");
+                                let (text, color) = match ls.phase {
+                                    Phase::BrowserOpen => (
+                                        t(Key::LoginStBrowserOpen),
+                                        Color32::from_rgb(220, 150, 60),
+                                    ),
+                                    Phase::Checking => {
+                                        (t(Key::LoginStChecking), Color32::from_rgb(140, 140, 150))
+                                    }
+                                    Phase::Idle if !has => {
+                                        (t(Key::LoginStNone), Color32::from_rgb(140, 140, 150))
+                                    }
+                                    Phase::Idle => match ls.signed_in {
+                                        Some(true) => {
+                                            (t(Key::LoginStOk), Color32::from_rgb(70, 180, 110))
+                                        }
+                                        Some(false) => {
+                                            (t(Key::LoginStNo), Color32::from_rgb(220, 90, 90))
+                                        }
+                                        None => (
+                                            t(Key::LoginStUnchecked),
+                                            Color32::from_rgb(140, 140, 150),
+                                        ),
+                                    },
+                                };
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("● {text}")).small().color(color),
+                                    );
+                                    if !ls.message.is_empty() {
+                                        ui.label(
+                                            RichText::new(&ls.message)
+                                                .small()
+                                                .color(Color32::from_rgb(220, 110, 110)),
+                                        );
+                                    }
+                                });
+                                ui.end_row();
+                            });
+                    }
+
+                    ui.collapsing(t(Key::LblOtherLogin), |ui| {
+                        egui::Grid::new("g_login")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label(t(Key::LblBrowserCookies));
+                                let app_login_active =
+                                    login::active_arg(&st.login_browser).is_some();
+                                ui.add_enabled_ui(
+                                    st.cookies_file.trim().is_empty() && !app_login_active,
+                                    |ui| {
+                                        egui::ComboBox::from_id_salt("cookies")
+                                            .width(160.0)
+                                            .selected_text(if st.cookies_from_browser.is_empty() {
+                                                t(Key::OptDisabled).to_string()
+                                            } else {
+                                                st.cookies_from_browser.clone()
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                for b in [
+                                                    "", "chrome", "edge", "firefox", "safari",
+                                                    "brave", "whale", "opera", "vivaldi",
+                                                    "chromium",
+                                                ] {
+                                                    let label = if b.is_empty() {
+                                                        t(Key::OptDisabled)
+                                                    } else {
+                                                        b
+                                                    };
+                                                    let mut cur = st.cookies_from_browser.clone();
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut cur,
+                                                            b.to_string(),
+                                                            label,
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        st.cookies_from_browser = cur;
+                                                        dirty = true;
+                                                    }
+                                                }
+                                            });
+                                    },
+                                )
+                                .response
+                                .on_hover_text(t(Key::TipBrowserCookies))
+                                .on_disabled_hover_text(t(Key::TipLoginOverrides));
+                                ui.end_row();
+
+                                ui.label(t(Key::LblCookiesFile));
+                                ui.horizontal(|ui| {
+                                    dirty |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut st.cookies_file)
+                                                .desired_width(240.0)
+                                                .hint_text(t(Key::HintCookiesFile)),
+                                        )
+                                        .on_hover_text(t(Key::TipCookiesFile))
+                                        .changed();
+                                    if ui.small_button(t(Key::BtnBrowse)).clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .add_filter("cookies.txt", &["txt"])
+                                            .pick_file()
                                         {
-                                            st.cookies_from_browser = cur;
+                                            st.cookies_file = p.display().to_string();
                                             dirty = true;
                                         }
                                     }
+                                    if !st.cookies_file.is_empty() && ui.small_button("✖").clicked()
+                                    {
+                                        st.cookies_file.clear();
+                                        dirty = true;
+                                    }
                                 });
-                            ui.end_row();
-                        });
+                                ui.end_row();
+                            });
+                    });
 
                     ui.add_space(10.0);
                     ui.heading(t(Key::HdrBehavior));
@@ -1298,6 +1840,10 @@ impl App {
                             .changed();
                         dirty |= ui
                             .checkbox(&mut st.auto_install_ffmpeg, t(Key::ChkAutoInstallFfmpeg))
+                            .changed();
+                        dirty |= ui
+                            .checkbox(&mut st.auto_install_deno, t(Key::ChkAutoInstallDeno))
+                            .on_hover_text(t(Key::TipJsRuntime))
                             .changed();
                     });
                     ui.add_space(4.0);
@@ -1434,6 +1980,40 @@ impl App {
                             });
                             ui.end_row();
 
+                            // ── JS 런타임 ──────────────────
+                            ui.label(t(Key::LblJsStatus))
+                                .on_hover_text(t(Key::TipJsRuntime));
+                            ui.vertical(|ui| {
+                                tool_status_line(ui, &tool_state.js);
+                                match (&tool_state.js_kind, &tool_state.js.path) {
+                                    (Some(kind), Some(p)) => {
+                                        ui.label(
+                                            RichText::new(format!("{kind} · {}", p.display()))
+                                                .small()
+                                                .weak(),
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            RichText::new(t(Key::MsgJsMissingWarn))
+                                                .small()
+                                                .color(Color32::from_rgb(220, 150, 60)),
+                                        );
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !tool_state.js.busy,
+                                        egui::Button::new(t(Key::BtnInstallUpdateNow)),
+                                    )
+                                    .on_hover_text(t(Key::TipInstallDeno))
+                                    .clicked()
+                                {
+                                    do_install_js = true;
+                                }
+                            });
+                            ui.end_row();
+
                             ui.label(t(Key::LblInstallDir));
                             ui.label(
                                 RichText::new(crate::tools::managed_dir().display().to_string())
@@ -1495,6 +2075,33 @@ impl App {
         }
         if do_install_ff {
             tools::spawn_install_ffmpeg(self.tools.clone(), ctx.clone());
+        }
+        if do_install_js {
+            tools::spawn_install_deno(self.tools.clone(), ctx.clone());
+        }
+        if let Some(b) = self.login_pick {
+            if do_login_open {
+                if let Some((_, exe)) = self.browsers.iter().find(|(x, _)| *x == b) {
+                    login::spawn_login(
+                        self.login.clone(),
+                        b,
+                        exe.clone(),
+                        self.settings.clone(),
+                        ctx.clone(),
+                    );
+                }
+            }
+            if do_login_check {
+                login::spawn_check(self.login.clone(), b, self.settings_snapshot(), ctx.clone());
+            }
+            if do_logout {
+                let mut ls = self.login.lock().unwrap();
+                ls.signed_in = None;
+                ls.message = match login::logout(b) {
+                    Ok(()) => String::new(),
+                    Err(e) => e.to_string(),
+                };
+            }
         }
         self.show_settings = open;
     }

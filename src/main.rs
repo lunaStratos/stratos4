@@ -4,10 +4,11 @@ mod app;
 mod config;
 mod engine;
 mod i18n;
+mod login;
 mod tools;
 mod util;
 
-use crate::config::Settings;
+use crate::config::{PlaylistMode, Settings};
 use crate::i18n::{apply_pref, t, tf, Key};
 
 fn main() -> eframe::Result<()> {
@@ -185,10 +186,12 @@ fn cli_download(urls: &[String]) {
         )
     );
 
+    // 명령줄에서는 항목을 고를 창이 없으므로 '골라서 받기' 는 '펼치기' 로 처리한다.
+    let mode = (settings.playlist_mode == PlaylistMode::Pick).then_some(PlaylistMode::Expand);
     let ctx = egui::Context::default();
     let engine = Engine::new(ctx, Arc::new(Mutex::new(settings)));
     for u in urls {
-        engine.add_url(u, None);
+        engine.add_url(u, mode);
     }
 
     let mut shown: std::collections::HashMap<u64, String> = std::collections::HashMap::new();

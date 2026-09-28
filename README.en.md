@@ -19,16 +19,29 @@ quality, and playlist handling without opening the settings window.
 - **Paste to download** — press `Ctrl/Cmd+V` in the window and the URL on the clipboard goes
   straight into the queue. If the clipboard holds several URLs, all of them are added.
   You can also drag and drop a text file containing URLs.
-- **Playlists / channels** — paste a list URL as-is. Three handling modes:
-  - `Expand into items` (default) — reads the list and creates one job per entry, so you get
+- **Playlists / channels** — paste a list URL as-is. Four handling modes:
+  - `Pick items to download` (default) — reads the list, then opens a picker with everything ticked;
+    untick what you don't want (a header checkbox toggles everything; title filter, invert,
+    `Shift+click` ranges). The `Upload date` row checks or unchecks items on/after or before a date
+    (YouTube lists only say "3 weeks ago", so dates marked `≈` are approximate).
+    Closed it? Reopen it from the list job's `Choose items` button.
+  - `Expand into items` — reads the list and creates one job per entry right away, so you get
     per-item progress, retries, and concurrent downloads.
   - `One batch job` — yt-dlp processes the whole list in order as a single job.
   - `This video only` — ignores the `list=` parameter and grabs just that video.
+- **Login** — download private playlists, Watch Later, Liked videos and members-only content.
+  `Settings → Login → Open login window` opens an installed browser (Firefox recommended) with an
+  **app-only profile**. Sign in to YouTube there and quit the browser; the app checks the login and
+  uses those cookies from then on. Your usual browser profile is untouched, and `Log out` deletes
+  only the app profile. Under `Other methods` you can instead use your usual browser's cookies or a
+  `cookies.txt` exported with a browser extension.
 - **Quick settings** — change `Download (video/audio)`, `Quality`, and `Playlist handling`
   from the top bar without opening the settings window.
-- **Automatic yt-dlp / ffmpeg management** — on startup the app checks whether they are
+- **Automatic yt-dlp / ffmpeg / Deno management** — on startup the app checks whether they are
   installed and whether a newer release exists, downloads them if missing, and updates them
-  when a new version appears. Nothing has to be installed system-wide.
+  when a new version appears. Nothing has to be installed system-wide. Deno is needed to solve
+  YouTube's JS challenge (without it downloads can fail with "Requested format is not available");
+  an existing Deno, Node or Bun is used if present.
 - **Multilingual UI** — English, Japanese, Korean, Simplified Chinese, Arabic, German, French,
   Spanish, and Portuguese. It follows the OS display language by default and can be changed
   under `Settings → Language`, taking effect immediately. System fonts covering the selected

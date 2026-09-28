@@ -36,6 +36,8 @@ pub enum ThemePref {
 pub enum PlaylistMode {
     /// 목록을 펼쳐 항목마다 개별 작업으로 만든다 (항목별 진행률·재시도 가능)
     Expand,
+    /// 목록을 읽은 뒤 받을 항목을 사용자가 체크해서 고른다
+    Pick,
     /// 하나의 작업에서 yt-dlp 가 목록 전체를 순차 처리한다
     Single,
     /// 목록을 무시하고 해당 영상 하나만 받는다
@@ -100,6 +102,10 @@ pub struct Settings {
     pub proxy: String,
     /// "" | "chrome" | "edge" | "firefox" | "safari" | "brave" | "whale"
     pub cookies_from_browser: String,
+    /// Netscape 형식 cookies.txt 경로. 지정하면 다른 로그인 방법보다 우선한다
+    pub cookies_file: String,
+    /// 앱 전용 로그인 창에 쓴 브라우저 ("" = 안 씀). 평소 브라우저 쿠키보다 우선한다
+    pub login_browser: String,
 
     // ── 동작 ──────────────────────────────────────────
     /// 창에 붙여넣기(Ctrl/Cmd+V) 하면 곧바로 대기열에 추가한다
@@ -121,8 +127,13 @@ pub struct Settings {
     pub auto_update_tools: bool,
     /// 동작하는 ffmpeg 이 없으면 시작 시 자동으로 내려받는다
     pub auto_install_ffmpeg: bool,
+    /// JS 런타임이 없으면 Deno 를 자동으로 설치한다 (YouTube 에 필요)
+    pub auto_install_deno: bool,
     /// 마지막 업데이트 확인 시각 (unix epoch secs)
     pub last_update_check: i64,
+    /// 설정 파일 형식 판. 파일에 없으면(옛 설정) 0 으로 읽혀 한 번만 이관한다
+    #[serde(default)]
+    pub settings_rev: u32,
 
     // ── 기타 ──────────────────────────────────────────
     pub theme: ThemePref,
@@ -161,7 +172,7 @@ impl Default for Settings {
             sub_langs: "ko,en".into(),
             sponsorblock_remove: false,
 
-            playlist_mode: PlaylistMode::Expand,
+            playlist_mode: PlaylistMode::Pick,
             playlist_items: String::new(),
             playlist_expand_limit: 200,
             playlist_reverse: false,
@@ -172,6 +183,8 @@ impl Default for Settings {
             retries: 10,
             proxy: String::new(),
             cookies_from_browser: String::new(),
+            cookies_file: String::new(),
+            login_browser: String::new(),
 
             paste_to_download: true,
             clipboard_watch: false,
@@ -184,7 +197,9 @@ impl Default for Settings {
             auto_update_check: true,
             auto_update_tools: true,
             auto_install_ffmpeg: true,
+            auto_install_deno: true,
             last_update_check: 0,
+            settings_rev: SETTINGS_REV,
 
             theme: ThemePref::System,
             language: None,
@@ -201,6 +216,9 @@ pub fn default_download_dir() -> PathBuf {
 }
 
 /// 앱 전용 데이터 디렉터리 (설정/관리형 yt-dlp 바이너리 보관)
+/// 현재 설정 파일 형식 판 ([`Settings::migrate`] 참고)
+const SETTINGS_REV: u32 = 1;
+
 pub fn app_dir() -> PathBuf {
     directories::ProjectDirs::from("dev", "stratos", "stratos-dl")
         .map(|d| d.data_dir().to_path_buf())
@@ -213,10 +231,28 @@ pub fn config_path() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Self {
-        match std::fs::read_to_string(config_path()) {
+        let mut st: Self = match std::fs::read_to_string(config_path()) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        if st.migrate() {
+            st.save();
         }
+        st
+    }
+
+    /// 옛 설정을 현재 판으로 올린다. 바뀐 게 있으면 true
+    fn migrate(&mut self) -> bool {
+        if self.settings_rev >= SETTINGS_REV {
+            return false;
+        }
+        // 판 1: 기본 목록 처리 방식이 '펼치기' → '골라서 받기' 로 바뀌었다.
+        // 예전 기본값을 그대로 쓰던 경우만 새 기본값으로 옮긴다.
+        if self.settings_rev < 1 && self.playlist_mode == PlaylistMode::Expand {
+            self.playlist_mode = PlaylistMode::Pick;
+        }
+        self.settings_rev = SETTINGS_REV;
+        true
     }
 
     pub fn save(&self) {
@@ -409,10 +445,7 @@ impl Settings {
             push(&mut a, "--proxy");
             a.push(self.proxy.trim().to_string());
         }
-        if !self.cookies_from_browser.trim().is_empty() {
-            push(&mut a, "--cookies-from-browser");
-            a.push(self.cookies_from_browser.trim().to_string());
-        }
+        a.extend(self.auth_args());
 
         if let Some(dir) = ffmpeg_dir {
             push(&mut a, "--ffmpeg-location");
@@ -421,6 +454,30 @@ impl Settings {
 
         a.extend(shell_split(&self.extra_args));
         a
+    }
+
+    /// 로그인(쿠키) 인자 — 비공개·회원 전용 영상과 플레이리스트에 필요하다.
+    /// 해석 단계와 다운로드 단계에서 공용.
+    ///
+    /// 우선순위: cookies.txt → 앱 전용 로그인 → 평소 브라우저 쿠키.
+    /// 파일과 브라우저를 함께 주면 yt-dlp 가 브라우저 쿠키를 cookies.txt 에 덮어쓰므로
+    /// 하나만 쓴다.
+    pub fn auth_args(&self) -> Vec<String> {
+        let file = self.cookies_file.trim();
+        let browser = self.cookies_from_browser.trim();
+        if !file.is_empty() {
+            vec!["--cookies".into(), file.into()]
+        } else if let Some(arg) = crate::login::active_arg(&self.login_browser) {
+            vec!["--cookies-from-browser".into(), arg]
+        } else if !browser.is_empty() {
+            vec!["--cookies-from-browser".into(), browser.into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn has_auth(&self) -> bool {
+        !self.auth_args().is_empty()
     }
 
     /// 플레이리스트 관련 인자 (해석 단계와 다운로드 단계에서 공용)
@@ -439,5 +496,30 @@ impl Settings {
             a.push("--no-playlist".to_string());
         }
         a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_move_to_pick_once() {
+        // 판 표시가 없는 옛 설정: 예전 기본값 '펼치기' → '골라서 받기'
+        let mut st: Settings = serde_json::from_str(r#"{"playlist_mode":"Expand"}"#).unwrap();
+        assert_eq!(st.settings_rev, 0);
+        assert!(st.migrate());
+        assert_eq!(st.playlist_mode, PlaylistMode::Pick);
+        assert_eq!(st.settings_rev, SETTINGS_REV);
+
+        // 이관 뒤 사용자가 다시 '펼치기' 를 고르면 그대로 둔다.
+        st.playlist_mode = PlaylistMode::Expand;
+        assert!(!st.migrate());
+        assert_eq!(st.playlist_mode, PlaylistMode::Expand);
+
+        // 옛 설정이라도 사용자가 고른 다른 방식은 건드리지 않는다.
+        let mut st: Settings = serde_json::from_str(r#"{"playlist_mode":"Single"}"#).unwrap();
+        assert!(st.migrate());
+        assert_eq!(st.playlist_mode, PlaylistMode::Single);
     }
 }
