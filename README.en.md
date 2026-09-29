@@ -54,6 +54,7 @@ quality, and playlist handling without opening the settings window.
 
 ## Version history
 
+- **1.2** — pick items from playlists/channels (upload-date filter), app-only login, cancel all, managed Deno JS runtime
 - **1.1** — nine-language UI (English / Japanese / Korean / Chinese / Arabic / German / French / Spanish / Portuguese)
 - **1.0** — downloading confirmed working
 
